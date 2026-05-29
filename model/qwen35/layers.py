@@ -14,10 +14,6 @@ def _get(config: Any, name: str, default: Any = None) -> Any:
     return getattr(config, name, default)
 
 
-def _silu(x: torch.Tensor) -> torch.Tensor:
-    return F.silu(x)
-
-
 def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return x
@@ -84,13 +80,16 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
 
+    # Normalization factor over hidden dimension; gamma = 1.0 + weight
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
         output = x.float()
         output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.eps)
         output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+        return output.to(input_dtype)
 
 
+# Gate is not related to RMSNorm, their joint appearance is for fusing both ops
 class RMSNormGated(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -102,7 +101,9 @@ class RMSNormGated(nn.Module):
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         x = self.weight.float() * x
-        x = x * F.silu(gate.float())
+        x = x * F.silu(
+            gate.float()
+        )  # gate modulates: SiLU(z) ≈ 0 → suppress, SiLU(z) > 1 → amplify
         return x.to(input_dtype)
 
 
@@ -117,7 +118,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(_silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class RotaryEmbedding(nn.Module):
