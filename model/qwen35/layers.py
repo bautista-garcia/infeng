@@ -83,10 +83,10 @@ class RMSNorm(nn.Module):
     # Normalization factor over hidden dimension; gamma = 1.0 + weight
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
-        output = x.float()
-        output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.eps)
-        output = output * (1.0 + self.weight.float())
-        return output.to(input_dtype)
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        x = x * (1.0 + self.weight.float())
+        return x.to(input_dtype)
 
 
 # Gate is not related to RMSNorm, their joint appearance is for fusing both ops
@@ -138,7 +138,11 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if position_ids.ndim == 1:
             position_ids = position_ids[None, :]
@@ -156,7 +160,14 @@ class RotaryEmbedding(nn.Module):
         freqs = (inv_freq.to(x.device) @ pos.to(x.device)).transpose(2, 3)
         freqs = self._apply_interleaved_mrope(freqs)
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype=x.dtype), emb.sin().to(dtype=x.dtype)
+        cos = emb.cos().to(dtype=x.dtype).unsqueeze(1)
+        sin = emb.sin().to(dtype=x.dtype).unsqueeze(1)
+
+        q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
+        k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
+        q = torch.cat((q_rot * cos + _rotate_half(q_rot) * sin, q_pass), dim=-1)
+        k = torch.cat((k_rot * cos + _rotate_half(k_rot) * sin, k_pass), dim=-1)
+        return q, k
 
     def _apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
         freqs_t = freqs[0].clone()
@@ -164,20 +175,6 @@ class RotaryEmbedding(nn.Module):
             length = self.mrope_section[dim] * 3
             freqs_t[..., offset:length:3] = freqs[dim, ..., offset:length:3]
         return freqs_t
-
-    @staticmethod
-    def apply(
-        q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        rotary_dim = cos.shape[-1]
-
-        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-        q = torch.cat((q_rot * cos + _rotate_half(q_rot) * sin, q_pass), dim=-1)
-        k = torch.cat((k_rot * cos + _rotate_half(k_rot) * sin, k_pass), dim=-1)
-        return q, k
 
 
 class FullAttention(nn.Module):
@@ -212,11 +209,12 @@ class FullAttention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
+        self.rotary_emb = RotaryEmbedding(config)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         cache: FullAttentionCache | None = None,
     ) -> torch.Tensor:
@@ -240,9 +238,8 @@ class FullAttention(nn.Module):
             .transpose(1, 2)
         )
 
-        cos, sin = position_embeddings
-        query_states, key_states = RotaryEmbedding.apply(
-            query_states, key_states, cos, sin
+        query_states, key_states = self.rotary_emb(
+            query_states, key_states, hidden_states, position_ids
         )
 
         if cache is not None:
@@ -459,7 +456,7 @@ class DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         cache: FullAttentionCache | DeltaNetCache | None = None,
     ) -> torch.Tensor:
@@ -473,7 +470,7 @@ class DecoderLayer(nn.Module):
         else:
             hidden_states = self.self_attn(
                 hidden_states,
-                position_embeddings=position_embeddings,
+                position_ids=position_ids,
                 attention_mask=attention_mask,
                 cache=cache,
             )
