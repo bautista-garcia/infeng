@@ -73,6 +73,14 @@ class Cache:
                 raise ValueError(f"unknown Qwen3.5 layer type: {layer_type}")
         return cls(layers)
 
+class Linear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -113,9 +121,9 @@ class MLP(nn.Module):
         hidden_size = _get(config, "hidden_size")
         intermediate_size = _get(config, "intermediate_size")
 
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -191,20 +199,20 @@ class FullAttention(nn.Module):
         attention_bias = _get(config, "attention_bias", False)
         eps = _get(config, "rms_norm_eps", 1e-6)
 
-        self.q_proj = nn.Linear(
+        self.q_proj = Linear(
             self.hidden_size, self.num_heads * self.head_dim * 2, bias=attention_bias
         )
-        self.k_proj = nn.Linear(
+        self.k_proj = Linear(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=attention_bias,
         )
-        self.v_proj = nn.Linear(
+        self.v_proj = Linear(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=attention_bias,
         )
-        self.o_proj = nn.Linear(
+        self.o_proj = Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=attention_bias
         )
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
@@ -298,10 +306,10 @@ class GatedDeltaNet(nn.Module):
         eps = _get(config, "rms_norm_eps", 1e-6)
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
-        self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_qkv = Linear(self.hidden_size, self.conv_dim, bias=False)
+        self.in_proj_z = Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.conv1d = nn.Conv1d(
             self.conv_dim,
             self.conv_dim,
@@ -313,7 +321,7 @@ class GatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.empty(self.num_v_heads).uniform_(0, 16).log_())
         self.norm = RMSNormGated(self.head_v_dim, eps=eps)
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
 
     def forward(
         self,
