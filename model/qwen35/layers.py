@@ -45,6 +45,7 @@ class FullAttentionCache:
             self.keys = keys
             self.values = values
         else:
+            # (B, H, L, d) so we append on the token dimension
             self.keys = torch.cat((self.keys, keys), dim=2)
             self.values = torch.cat((self.values, values), dim=2)
         return self.keys, self.values
@@ -72,6 +73,7 @@ class Cache:
             else:
                 raise ValueError(f"unknown Qwen3.5 layer type: {layer_type}")
         return cls(layers)
+
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
@@ -195,7 +197,6 @@ class FullAttention(nn.Module):
         self.head_dim = _get(config, "head_dim", self.hidden_size // self.num_heads)
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
-        self.attention_dropout = _get(config, "attention_dropout", 0.0)
         attention_bias = _get(config, "attention_bias", False)
         eps = _get(config, "rms_norm_eps", 1e-6)
 
@@ -227,25 +228,34 @@ class FullAttention(nn.Module):
         cache: FullAttentionCache | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-
+        # Q = x @ Wq, gate = x @ W_gate; It does a fused matmul (due to both sharing x)
         q_and_gate = self.q_proj(hidden_states).view(
             batch_size, seq_len, self.num_heads, self.head_dim * 2
         )
+        # (B, L, H, 2D) into two (B, L, H, D): H is num_heads
         query_states, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
 
+        # RMSNorm(Q)
         query_states = self.q_norm(query_states).transpose(1, 2)
+
+        # K = RMSNorm(x @ Wk)
         key_states = self.k_norm(
             self.k_proj(hidden_states).view(
                 batch_size, seq_len, self.num_key_value_heads, self.head_dim
             )
         ).transpose(1, 2)
+
+        # Transposing goes to a (B, H, L, D) so that B and H are fully independent (parallel)
+
+        # V = x @ Wv (Value does not go through RoPE)
         value_states = (
             self.v_proj(hidden_states)
             .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
             .transpose(1, 2)
         )
 
+        # RoPE(Q, K)
         query_states, key_states = self.rotary_emb(
             query_states, key_states, hidden_states, position_ids
         )
@@ -253,24 +263,14 @@ class FullAttention(nn.Module):
         if cache is not None:
             key_states, value_states = cache.update(key_states, value_states)
 
-        attn_output = self._attention(
-            query_states, key_states, value_states, attention_mask
-        )
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
-        attn_output = attn_output * torch.sigmoid(gate)
-        return self.o_proj(attn_output)
+        # GQA: K & V from (B, H=4, L, D) into (B, H=16, L, D) by repeating each K, V head 4 times
+        key_states = _repeat_kv(key_states, self.num_key_value_groups)
+        value_states = _repeat_kv(value_states, self.num_key_value_groups)
 
-    def _attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        key = _repeat_kv(key, self.num_key_value_groups)
-        value = _repeat_kv(value, self.num_key_value_groups)
-        scores = torch.matmul(query, key.transpose(2, 3)) * self.scaling
+        # Q @ K^T/sqrt(d)
+        scores = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
 
+        # Applies passed mask, or usual lower-triangular causal mask
         if attention_mask is not None:
             if attention_mask.ndim == 2:
                 scores = scores.masked_fill(
@@ -280,15 +280,20 @@ class FullAttention(nn.Module):
             else:
                 scores = scores + attention_mask
         else:
-            q_len, k_len = query.shape[-2], key.shape[-2]
+            q_len, k_len = query_states.shape[-2], key_states.shape[-2]
             causal_mask = torch.ones(
-                q_len, k_len, dtype=torch.bool, device=query.device
+                q_len, k_len, dtype=torch.bool, device=query_states.device
             ).tril(diagonal=k_len - q_len)
             scores = scores.masked_fill(~causal_mask, -torch.inf)
 
-        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-        probs = F.dropout(probs, p=self.attention_dropout, training=self.training)
-        return torch.matmul(probs, value)
+        # Softmax(QK^T/sqrt(d)) @ V
+        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(probs, value_states)
+        # Back to (B, L, D)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        # Gating/modulation with the gate vector
+        attn_output = attn_output * torch.sigmoid(gate)
+        return self.o_proj(attn_output)
 
 
 class GatedDeltaNet(nn.Module):
