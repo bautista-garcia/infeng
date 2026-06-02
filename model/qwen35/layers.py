@@ -344,12 +344,17 @@ class GatedDeltaNet(nn.Module):
         z = self.in_proj_z(hidden_states).reshape(
             batch_size, seq_len, self.num_v_heads, self.head_v_dim
         )
+        # Local Learning rate (0,1)
         beta = torch.sigmoid(self.in_proj_b(hidden_states))
+        # Global decay: gt = exp(g), so a highly negative value reduces the impact of St-1 (short term memory)
+        #, a lower negative value amplifies the impact of St-1 (long term memory)
         g = -self.A_log.float().exp() * F.softplus(
             self.in_proj_a(hidden_states).float() + self.dt_bias
         )
 
         mixed_qkv = self._causal_conv(mixed_qkv, cache).transpose(1, 2)
+
+        # (B, L, dk + dq + dv) into (B, L, dk), (B, L, dk), (B, L, dv)
         query, key, value = torch.split(
             mixed_qkv, (self.key_dim, self.key_dim, self.value_dim), dim=-1
         )
@@ -357,6 +362,7 @@ class GatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
+        # Grouped Query Attention (GQA) 
         if self.num_v_heads != self.num_k_heads:
             repeat = self.num_v_heads // self.num_k_heads
             query = query.repeat_interleave(repeat, dim=2)
@@ -407,6 +413,7 @@ class GatedDeltaNet(nn.Module):
 
         batch_size, num_heads, seq_len, key_dim = key.shape
         value_dim = value.shape[-1]
+        # This is the S memory matrix (B, H, Dk, Dv) 
         state = (
             torch.zeros(
                 batch_size,
@@ -435,10 +442,11 @@ class GatedDeltaNet(nn.Module):
             v_t = value[:, :, token_idx]
             g_t = g[:, :, token_idx].exp().unsqueeze(-1).unsqueeze(-1)
             beta_t = beta[:, :, token_idx].unsqueeze(-1)
-
             state = state * g_t
+            # Value prediction: S * k_t = hat(v_t)
             prediction = (state * k_t.unsqueeze(-1)).sum(dim=-2)
             delta = (v_t - prediction) * beta_t
+            # St = St-1 * exp(g) + beta * (Vt - prediction) * Kt -> Delta is (B, H, Dv) and Kt is (B, H, Dk) so we unsqueeze to do outer product and get (B, H, Dk, Dv)
             state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
             output[:, :, token_idx] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
 
