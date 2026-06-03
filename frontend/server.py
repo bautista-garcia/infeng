@@ -21,8 +21,17 @@ class Handler(SimpleHTTPRequestHandler):
         if Handler.engine is not None:
             return
         Handler.loading = True
-        print(f"loading model on {Handler.args.device} with {Handler.args.dtype}", flush=True)
-        Handler.engine = InferenceEngine(Handler.args.config, Handler.args.weights, Handler.args.tokenizer, device=Handler.args.device, dtype=Handler.args.dtype)
+        print(
+            f"loading model on {Handler.args.device} with {Handler.args.dtype}",
+            flush=True,
+        )
+        Handler.engine = InferenceEngine(
+            Handler.args.config,
+            Handler.args.weights,
+            Handler.args.tokenizer,
+            device=Handler.args.device,
+            dtype=Handler.args.dtype,
+        )
         Handler.loading = False
         print(
             f"model loaded on {Handler.engine.device} with {Handler.engine.dtype}; missing={len(Handler.engine.report['missing'])} unexpected={len(Handler.engine.report['unexpected'])}",
@@ -55,18 +64,30 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_POST(self):
+        if self.path == "/api/load":
+            body = {"ok": True}
+            if Handler.engine is None and not Handler.loading:
+                import threading
+
+                threading.Thread(target=Handler.load_model, daemon=True).start()
+                body = {"ok": True, "loading": True}
+            elif Handler.loading:
+                body = {"ok": True, "loading": True}
+            else:
+                body = {"ok": True, "loaded": True}
+            payload = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path != "/api/chat":
             self.send_error(404)
             return
         data = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
         try:
             print("chat request received", flush=True)
-            Handler.load_model()
-            prompt = data["message"]
-            stop_ids = [
-                Handler.engine.tokenizer.eos_token_id,
-                Handler.engine.tokenizer.convert_tokens_to_ids("<|im_end|>"),
-            ]
 
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
@@ -74,22 +95,46 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("connection", "keep-alive")
             self.end_headers()
 
+            if Handler.engine is None:
+                event = json.dumps({"status": "Loading model..."})
+                self.wfile.write(f"data: {event}\n\n".encode())
+                self.wfile.flush()
+            Handler.load_model()
+
+            event = json.dumps({"status": "Generating..."})
+            self.wfile.write(f"data: {event}\n\n".encode())
+            self.wfile.flush()
+
+            messages = data.get("messages")
+            if messages is None:
+                messages = [{"role": "user", "content": data["message"]}]
+            stop_ids = [
+                Handler.engine.tokenizer.eos_token_id,
+                Handler.engine.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+            ]
+
+            thinking_enabled = data.get("thinking", Handler.args.thinking)
+            temperature = data.get("temperature", Handler.args.temperature)
+            top_p = data.get("top_p", Handler.args.top_p)
+            top_k = data.get("top_k", Handler.args.top_k)
             gen = Handler.engine.generate(
-                prompt,
+                messages,
                 max_new_tokens=Handler.args.max_new_tokens,
-                thinking=Handler.args.thinking,
+                thinking=thinking_enabled,
                 stop_token_ids=stop_ids,
-                temperature=Handler.args.temperature,
-                top_p=Handler.args.top_p,
-                top_k=Handler.args.top_k,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
             )
             think_end_str = "</think>"
             accumulated = ""
             thinking = ""
             response_text = ""
-            mode = "thinking" if Handler.args.thinking else "response"
+            mode = "thinking" if thinking_enabled else "response"
 
             for token_id in gen:
+                if not response_text and not thinking:
+                    print("first token generated", flush=True)
                 token_text = Handler.engine.tokenizer.decode(
                     [token_id], skip_special_tokens=False
                 )
@@ -146,15 +191,27 @@ def main():
     parser.add_argument(
         "--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"]
     )
-    parser.add_argument("--max-new-tokens", type=int)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--preload", action="store_true")
     Handler.args, Handler.root = parser.parse_args(), Path(__file__).parent
-    Handler.args.temperature = Handler.args.temperature if Handler.args.temperature is not None else 0.6 if Handler.args.thinking else 0.7
-    Handler.args.top_p = Handler.args.top_p if Handler.args.top_p is not None else 0.95 if Handler.args.thinking else 0.8
+    Handler.args.temperature = (
+        Handler.args.temperature
+        if Handler.args.temperature is not None
+        else 0.6
+        if Handler.args.thinking
+        else 0.7
+    )
+    Handler.args.top_p = (
+        Handler.args.top_p
+        if Handler.args.top_p is not None
+        else 0.95
+        if Handler.args.thinking
+        else 0.8
+    )
     print(f"http://{Handler.args.host}:{Handler.args.port}")
     if Handler.args.preload:
         Handler.load_model()
