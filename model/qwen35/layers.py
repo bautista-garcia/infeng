@@ -389,10 +389,15 @@ class GatedDeltaNet(nn.Module):
 
         prev = cache.conv_state
         conv_input = x if prev is None else torch.cat((prev, x), dim=-1)
-        state_len = self.conv_kernel_size - 1
-        cache.conv_state = conv_input[:, :, -state_len:].detach()
+        cache.conv_state = F.pad(conv_input, (self.conv_kernel_size - conv_input.shape[-1], 0))[
+            :, :, -self.conv_kernel_size :
+        ].detach()
 
-        output = F.silu(self.conv1d(conv_input)[:, :, : conv_input.shape[-1]])
+        output = F.silu(
+            F.conv1d(conv_input, self.conv1d.weight, groups=self.conv_dim)
+            if prev is not None
+            else self.conv1d(conv_input)[:, :, : conv_input.shape[-1]]
+        )
         return output[:, :, -seq_len:]
 
     def _recurrent_delta_rule(
