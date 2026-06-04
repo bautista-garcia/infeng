@@ -53,3 +53,9 @@ lightning_logs/
 # Misc
 *.log
 .env
+
+weights/
+
+skills-lock.json
+
+.agents/

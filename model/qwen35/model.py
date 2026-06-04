@@ -20,39 +20,29 @@ class TextModel(nn.Module):
                 config = json.load(f)
         self.config = config["text_config"] if "text_config" in config else config
         # (L, d_model)
-        self.embed_tokens = nn.Embedding(
-            self.config["vocab_size"], self.config["hidden_size"]
-        )
-        self.layers = nn.ModuleList(
-            DecoderLayer(self.config, i)
-            for i in range(self.config["num_hidden_layers"])
-        )
-        self.norm = RMSNorm(
-            self.config["hidden_size"], eps=self.config.get("rms_norm_eps", 1e-6)
-        )
+        self.embed_tokens = nn.Embedding(self.config["vocab_size"], self.config["hidden_size"])
+        self.layers = nn.ModuleList(DecoderLayer(self.config, i) for i in range(self.config["num_hidden_layers"]))
+        self.norm = RMSNorm(self.config["hidden_size"], eps=self.config.get("rms_norm_eps", 1e-6))
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        cache: Cache | None = None,
-        use_cache: bool = False,
-    ) -> tuple[torch.Tensor, Cache | None]:
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None,
+                attention_mask: torch.Tensor | None = None, cache: Cache | None = None,
+                use_cache: bool = False) -> tuple[torch.Tensor, Cache | None]:
         if use_cache and not cache:
             cache = Cache.from_config(self.config)
 
         # Scan for KV cache to know current seq_len
-        past_len = next((l.keys.shape[2] for l in cache.layers if getattr(l, "keys", None) is not None), 0) if cache else 0
+        cached_keys = (l.keys for l in cache.layers if getattr(l, "keys", None) is not None) if cache else ()
+        past_len = next((keys.shape[2] for keys in cached_keys), 0)
 
         # Build position_ids for new prompt
         if position_ids is None:
-            position_ids = torch.arange(past_len, past_len + input_ids.shape[1], device=input_ids.device)[None, :].expand(input_ids.shape[0], -1)
+            position_ids = torch.arange(past_len, past_len + input_ids.shape[1], device=input_ids.device)
+            position_ids = position_ids[None, :].expand(input_ids.shape[0], -1)
 
         # Embedding + 32 decoder layers + RMSNorm
         hidden_states = self.embed_tokens(input_ids)
         layer_caches = cache.layers if cache else [None] * len(self.layers)
-        
+
         for layer, l_cache in zip(self.layers, layer_caches):
             hidden_states = layer(hidden_states, position_ids, attention_mask=attention_mask, cache=l_cache)
 
@@ -64,21 +54,14 @@ class ForCausalLM(nn.Module):
         super().__init__()
         self.model = TextModel(config)
         self.config = self.model.config
-        self.lm_head = (
-            None
-            if self.config.get("tie_word_embeddings", True)
-            else Linear(
-                self.config["hidden_size"], self.config["vocab_size"], bias=False
-            )
-        )
+        if self.config.get("tie_word_embeddings", True):
+            self.lm_head = None
+        else:
+            self.lm_head = Linear(self.config["hidden_size"], self.config["vocab_size"], bias=False)
 
     @classmethod
-    def build(
-        cls,
-        config: str | Path | dict[str, Any] = "config.json",
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> "ForCausalLM":
+    def build(cls, config: str | Path | dict[str, Any] = "config.json", device: torch.device | str | None = None,
+              dtype: torch.dtype | None = None) -> "ForCausalLM":
         old_dtype = torch.get_default_dtype()
         if dtype is not None:
             torch.set_default_dtype(dtype)
@@ -88,24 +71,13 @@ class ForCausalLM(nn.Module):
         finally:
             torch.set_default_dtype(old_dtype)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        cache: Cache | None = None,
-        use_cache: bool = False,
-    ) -> tuple[torch.Tensor, Cache | None]:
-        hidden_states, cache = self.model(
-            input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            cache=cache,
-            use_cache=use_cache,
-        )
-        logits = (
-            F.linear(hidden_states, self.model.embed_tokens.weight)
-            if self.lm_head is None
-            else self.lm_head(hidden_states)
-        )
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None,
+                attention_mask: torch.Tensor | None = None, cache: Cache | None = None,
+                use_cache: bool = False) -> tuple[torch.Tensor, Cache | None]:
+        hidden_states, cache = self.model(input_ids, position_ids=position_ids, attention_mask=attention_mask,
+                                          cache=cache, use_cache=use_cache)
+        if self.lm_head is None:
+            logits = F.linear(hidden_states, self.model.embed_tokens.weight)
+        else:
+            logits = self.lm_head(hidden_states)
         return logits, cache

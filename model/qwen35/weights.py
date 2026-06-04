@@ -35,7 +35,9 @@ def _key(key: str, target: set[str]) -> str | None:
         candidates.append(key[6:])
     if key.startswith("lm_head.") and "lm_head.linear." + key[8:] in target:
         candidates.append("lm_head.linear." + key[8:])
-    for suffix in ("proj", "gate_proj", "up_proj", "down_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj", "lm_head"):
+    suffixes = ("proj", "gate_proj", "up_proj", "down_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
+                "out_proj", "lm_head")
+    for suffix in suffixes:
         candidates.append(key.replace(f".{suffix}.weight", f".{suffix}.linear.weight"))
         candidates.append(key.replace(f".{suffix}.bias", f".{suffix}.linear.bias"))
     for candidate in candidates:
@@ -95,9 +97,10 @@ def _gguf_tensors(file: Path) -> dict[str, torch.Tensor]:
         for name, shape, typ, offset in infos:
             if typ not in GGUF_TYPES:
                 continue
-            size = torch.empty(shape, dtype=GGUF_TYPES[typ]).numel() * torch.empty((), dtype=GGUF_TYPES[typ]).element_size()
+            dtype = GGUF_TYPES[typ]
+            size = torch.empty(shape, dtype=dtype).numel() * torch.empty((), dtype=dtype).element_size()
             f.seek(data_start + offset)
-            tensors[name] = torch.frombuffer(f.read(size), dtype=GGUF_TYPES[typ]).clone().reshape(shape)
+            tensors[name] = torch.frombuffer(f.read(size), dtype=dtype).clone().reshape(shape)
         return tensors
 
 
@@ -162,7 +165,8 @@ def _gguf_key(key: str, target: set[str]) -> str | None:
     return _key(key, target)
 
 
-def _undo_reorder_v_heads(tensor: torch.Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int) -> torch.Tensor:
+def _undo_reorder_v_heads(tensor: torch.Tensor, dim: int, num_k_heads: int, num_v_per_k: int,
+                          head_dim: int) -> torch.Tensor:
     if dim < 0:
         dim += tensor.ndim
     shape = list(tensor.shape)
@@ -195,13 +199,15 @@ def _undo_qwen35_gguf_reorder(target_key: str, tensor: torch.Tensor, model: torc
     if target_key.endswith("conv1d.weight"):
         data = tensor.squeeze(1)
         qk_dim = head_k_dim * num_k_heads * 2
-        return torch.cat((data[:qk_dim], _undo_reorder_v_heads(data[qk_dim:], 0, num_k_heads, num_v_per_k, head_v_dim)), dim=0)[:, None, :]
+        v = _undo_reorder_v_heads(data[qk_dim:], 0, num_k_heads, num_v_per_k, head_v_dim)
+        return torch.cat((data[:qk_dim], v), dim=0)[:, None, :]
     if target_key.endswith("out_proj.linear.weight"):
         return _undo_reorder_v_heads(tensor, 1, num_k_heads, num_v_per_k, head_v_dim)
     return tensor
 
 
-def _copy_tensor(model: torch.nn.Module, target: dict[str, torch.Tensor], target_key: str, tensor: torch.Tensor, is_gguf: bool):
+def _copy_tensor(model: torch.nn.Module, target: dict[str, torch.Tensor], target_key: str, tensor: torch.Tensor,
+                 is_gguf: bool):
     if tensor.shape != target[target_key].shape and target[target_key].ndim == 3:
         tensor = tensor[:, None, :]
     if tensor.shape != target[target_key].shape and tensor.ndim == 2:
@@ -210,13 +216,8 @@ def _copy_tensor(model: torch.nn.Module, target: dict[str, torch.Tensor], target
         tensor = torch.log(-tensor.float())
     if is_gguf:
         tensor = _undo_qwen35_gguf_reorder(target_key, tensor, model)
-    if is_gguf and (
-        target_key.endswith("input_layernorm.weight")
-        or target_key.endswith("post_attention_layernorm.weight")
-        or target_key.endswith("q_norm.weight")
-        or target_key.endswith("k_norm.weight")
-        or target_key == "model.norm.weight"
-    ):
+    norm_weights = ("input_layernorm.weight", "post_attention_layernorm.weight", "q_norm.weight", "k_norm.weight")
+    if is_gguf and (target_key.endswith(norm_weights) or target_key == "model.norm.weight"):
         tensor = tensor.float() - 1
     target[target_key].copy_(tensor.to(dtype=target[target_key].dtype))
 
@@ -235,9 +236,11 @@ def load_weights(model: torch.nn.Module, path: str | Path, strict: bool = False)
                     unexpected.append(source_key)
                 elif typ in GGUF_TYPES:
                     numel = torch.empty(shape, dtype=GGUF_TYPES[typ]).numel()
+                    dtype = GGUF_TYPES[typ]
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", UserWarning)
-                        tensor = torch.frombuffer(mm, dtype=GGUF_TYPES[typ], count=numel, offset=data_start + offset).reshape(shape)
+                        tensor = torch.frombuffer(mm, dtype=dtype, count=numel,
+                                                  offset=data_start + offset).reshape(shape)
                     _copy_tensor(model, target, target_key, tensor, True)
                     loaded.add(target_key)
             if any(t.device.type == "mps" for t in target.values()):
@@ -246,7 +249,8 @@ def load_weights(model: torch.nn.Module, path: str | Path, strict: bool = False)
             mm.close()
             f.close()
             continue
-        for source_key, tensor in (load_file(file) if file.suffix == ".safetensors" else torch.load(file, map_location="cpu")).items():
+        tensors = load_file(file) if file.suffix == ".safetensors" else torch.load(file, map_location="cpu")
+        for source_key, tensor in tensors.items():
             target_key = _key(source_key, set(target))
             if target_key is None:
                 unexpected.append(source_key)

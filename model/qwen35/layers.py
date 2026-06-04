@@ -38,9 +38,7 @@ class FullAttentionCache:
     keys: torch.Tensor | None = None
     values: torch.Tensor | None = None
 
-    def update(
-        self, keys: torch.Tensor, values: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def update(self, keys: torch.Tensor, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.keys is None:
             self.keys = keys
             self.values = values
@@ -139,21 +137,14 @@ class RotaryEmbedding(nn.Module):
         theta = rope_parameters.get("rope_theta", 10000.0)
         partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
         rotary_dim = int(head_dim * partial_rotary_factor)
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
-        )
+        inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
 
         self.rotary_dim = rotary_dim
         self.mrope_section = rope_parameters.get("mrope_section", [11, 11, 10])
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, x: torch.Tensor,
+                position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if position_ids.ndim == 1:
             position_ids = position_ids[None, :]
         if position_ids.ndim == 2:
@@ -161,11 +152,7 @@ class RotaryEmbedding(nn.Module):
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             position_ids = position_ids[1:]
 
-        inv_freq = (
-            self.inv_freq[None, None, :, None]
-            .float()
-            .expand(3, position_ids.shape[1], -1, 1)
-        )
+        inv_freq = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
         pos = position_ids[:, :, None, :].float()
         freqs = (inv_freq.to(x.device) @ pos.to(x.device)).transpose(2, 3)
         freqs = self._apply_interleaved_mrope(freqs)
@@ -200,38 +187,19 @@ class FullAttention(nn.Module):
         attention_bias = _get(config, "attention_bias", False)
         eps = _get(config, "rms_norm_eps", 1e-6)
 
-        self.q_proj = Linear(
-            self.hidden_size, self.num_heads * self.head_dim * 2, bias=attention_bias
-        )
-        self.k_proj = Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=attention_bias,
-        )
-        self.v_proj = Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=attention_bias,
-        )
-        self.o_proj = Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=attention_bias
-        )
+        self.q_proj = Linear(self.hidden_size, self.num_heads * self.head_dim * 2, bias=attention_bias)
+        self.k_proj = Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=attention_bias)
+        self.v_proj = Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=attention_bias)
+        self.o_proj = Linear(self.num_heads * self.head_dim, self.hidden_size, bias=attention_bias)
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
         self.rotary_emb = RotaryEmbedding(config)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        cache: FullAttentionCache | None = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor,
+                attention_mask: torch.Tensor | None = None, cache: FullAttentionCache | None = None) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         # Q = x @ Wq, gate = x @ W_gate; It does a fused matmul (due to both sharing x)
-        q_and_gate = self.q_proj(hidden_states).view(
-            batch_size, seq_len, self.num_heads, self.head_dim * 2
-        )
+        q_and_gate = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim * 2)
         # (B, L, H, 2D) into two (B, L, H, D): H is num_heads
         query_states, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
@@ -240,25 +208,17 @@ class FullAttention(nn.Module):
         query_states = self.q_norm(query_states).transpose(1, 2)
 
         # K = RMSNorm(x @ Wk)
-        key_states = self.k_norm(
-            self.k_proj(hidden_states).view(
-                batch_size, seq_len, self.num_key_value_heads, self.head_dim
-            )
-        ).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads,
+                                                                 self.head_dim)).transpose(1, 2)
 
         # Transposing goes to a (B, H, L, D) so that B and H are fully independent (parallel)
 
         # V = x @ Wv (Value does not go through RoPE)
-        value_states = (
-            self.v_proj(hidden_states)
-            .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
-            .transpose(1, 2)
-        )
+        value_states = self.v_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads,
+                                                       self.head_dim).transpose(1, 2)
 
         # RoPE(Q, K)
-        query_states, key_states = self.rotary_emb(
-            query_states, key_states, hidden_states, position_ids
-        )
+        query_states, key_states = self.rotary_emb(query_states, key_states, hidden_states, position_ids)
 
         if cache is not None:
             key_states, value_states = cache.update(key_states, value_states)
@@ -273,17 +233,13 @@ class FullAttention(nn.Module):
         # Applies passed mask, or usual lower-triangular causal mask
         if attention_mask is not None:
             if attention_mask.ndim == 2:
-                scores = scores.masked_fill(
-                    attention_mask[:, None, None, :].to(torch.bool).logical_not(),
-                    -torch.inf,
-                )
+                scores = scores.masked_fill(attention_mask[:, None, None, :].to(torch.bool).logical_not(), -torch.inf)
             else:
                 scores = scores + attention_mask
         else:
             q_len, k_len = query_states.shape[-2], key_states.shape[-2]
-            causal_mask = torch.ones(
-                q_len, k_len, dtype=torch.bool, device=query_states.device
-            ).tril(diagonal=k_len - q_len)
+            causal_mask = torch.ones(q_len, k_len, dtype=torch.bool, device=query_states.device)
+            causal_mask = causal_mask.tril(diagonal=k_len - q_len)
             scores = scores.masked_fill(~causal_mask, -torch.inf)
 
         # Softmax(QK^T/sqrt(d)) @ V
@@ -315,49 +271,31 @@ class GatedDeltaNet(nn.Module):
         self.in_proj_z = Linear(self.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.conv1d = nn.Conv1d(
-            self.conv_dim,
-            self.conv_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=self.conv_dim,
-            padding=self.conv_kernel_size - 1,
-            bias=False,
-        )
+        self.conv1d = nn.Conv1d(self.conv_dim, self.conv_dim, kernel_size=self.conv_kernel_size,
+                                groups=self.conv_dim, padding=self.conv_kernel_size - 1, bias=False)
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.empty(self.num_v_heads).uniform_(0, 16).log_())
         self.norm = RMSNormGated(self.head_v_dim, eps=eps)
         self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        cache: DeltaNetCache | None = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None,
+                cache: DeltaNetCache | None = None) -> torch.Tensor:
         if attention_mask is not None and attention_mask.ndim == 2:
-            hidden_states = hidden_states * attention_mask[:, :, None].to(
-                hidden_states.dtype
-            )
+            hidden_states = hidden_states * attention_mask[:, :, None].to(hidden_states.dtype)
 
         batch_size, seq_len, _ = hidden_states.shape
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).reshape(
-            batch_size, seq_len, self.num_v_heads, self.head_v_dim
-        )
+        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         # Local Learning rate (0,1)
         beta = torch.sigmoid(self.in_proj_b(hidden_states))
         # Global decay: gt = exp(g), so a highly negative value reduces the impact of St-1 (short term memory)
         #, a lower negative value amplifies the impact of St-1 (long term memory)
-        g = -self.A_log.float().exp() * F.softplus(
-            self.in_proj_a(hidden_states).float() + self.dt_bias
-        )
+        g = -self.A_log.float().exp() * F.softplus(self.in_proj_a(hidden_states).float() + self.dt_bias)
 
         mixed_qkv = self._causal_conv(mixed_qkv, cache).transpose(1, 2)
 
         # (B, L, dk + dq + dv) into (B, L, dk), (B, L, dk), (B, L, dv)
-        query, key, value = torch.split(
-            mixed_qkv, (self.key_dim, self.key_dim, self.value_dim), dim=-1
-        )
+        query, key, value = torch.split(mixed_qkv, (self.key_dim, self.key_dim, self.value_dim), dim=-1)
         query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
@@ -369,9 +307,7 @@ class GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(repeat, dim=2)
 
         initial_state = None if cache is None else cache.recurrent_state
-        output, recurrent_state = self._recurrent_delta_rule(
-            query, key, value, g, beta, initial_state
-        )
+        output, recurrent_state = self._recurrent_delta_rule(query, key, value, g, beta, initial_state)
         if cache is not None:
             cache.recurrent_state = recurrent_state
 
@@ -380,9 +316,7 @@ class GatedDeltaNet(nn.Module):
         output = self.norm(output, z).reshape(batch_size, seq_len, self.value_dim)
         return self.out_proj(output)
 
-    def _causal_conv(
-        self, x: torch.Tensor, cache: DeltaNetCache | None
-    ) -> torch.Tensor:
+    def _causal_conv(self, x: torch.Tensor, cache: DeltaNetCache | None) -> torch.Tensor:
         seq_len = x.shape[-1]
         if cache is None:
             return F.silu(self.conv1d(x)[:, :, :seq_len])
@@ -393,22 +327,13 @@ class GatedDeltaNet(nn.Module):
             :, :, -self.conv_kernel_size :
         ].detach()
 
-        output = F.silu(
-            F.conv1d(conv_input, self.conv1d.weight, groups=self.conv_dim)
-            if prev is not None
-            else self.conv1d(conv_input)[:, :, : conv_input.shape[-1]]
-        )
+        output = F.silu(F.conv1d(conv_input, self.conv1d.weight, groups=self.conv_dim)
+                        if prev is not None else self.conv1d(conv_input)[:, :, : conv_input.shape[-1]])
         return output[:, :, -seq_len:]
 
-    def _recurrent_delta_rule(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        initial_state: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _recurrent_delta_rule(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                              g: torch.Tensor, beta: torch.Tensor,
+                              initial_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         initial_dtype = query.dtype
         query = _l2norm(query, dim=-1).transpose(1, 2).float()
         key = _l2norm(key, dim=-1).transpose(1, 2).float()
@@ -419,26 +344,12 @@ class GatedDeltaNet(nn.Module):
         batch_size, num_heads, seq_len, key_dim = key.shape
         value_dim = value.shape[-1]
         # This is the S memory matrix (B, H, Dk, Dv) 
-        state = (
-            torch.zeros(
-                batch_size,
-                num_heads,
-                key_dim,
-                value_dim,
-                dtype=value.dtype,
-                device=value.device,
-            )
-            if initial_state is None
-            else initial_state.to(value)
-        )
-        output = torch.empty(
-            batch_size,
-            num_heads,
-            seq_len,
-            value_dim,
-            dtype=value.dtype,
-            device=value.device,
-        )
+        shape = (batch_size, num_heads, key_dim, value_dim)
+        if initial_state is None:
+            state = torch.zeros(shape, dtype=value.dtype, device=value.device)
+        else:
+            state = initial_state.to(value)
+        output = torch.empty(batch_size, num_heads, seq_len, value_dim, dtype=value.dtype, device=value.device)
         scale = key_dim**-0.5
 
         for token_idx in range(seq_len):
@@ -451,7 +362,7 @@ class GatedDeltaNet(nn.Module):
             # Value prediction: S * k_t = hat(v_t)
             prediction = (state * k_t.unsqueeze(-1)).sum(dim=-2)
             delta = (v_t - prediction) * beta_t
-            # St = St-1 * exp(g) + beta * (Vt - prediction) * Kt -> Delta is (B, H, Dv) and Kt is (B, H, Dk) so we unsqueeze to do outer product and get (B, H, Dk, Dv)
+            # Outer product broadcasts delta (B, H, Dv) with Kt (B, H, Dk) into (B, H, Dk, Dv).
             state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
             output[:, :, token_idx] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
 
@@ -479,27 +390,17 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
         self.mlp = MLP(config)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        cache: FullAttentionCache | DeltaNetCache | None = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor,
+                attention_mask: torch.Tensor | None = None,
+                cache: FullAttentionCache | DeltaNetCache | None = None) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         if self.layer_type == "linear_attention":
-            hidden_states = self.linear_attn(
-                hidden_states, attention_mask=attention_mask, cache=cache
-            )
+            hidden_states = self.linear_attn(hidden_states, attention_mask=attention_mask, cache=cache)
         else:
-            hidden_states = self.self_attn(
-                hidden_states,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                cache=cache,
-            )
+            hidden_states = self.self_attn(hidden_states, position_ids=position_ids, attention_mask=attention_mask,
+                                           cache=cache)
 
         hidden_states = residual + hidden_states
         residual = hidden_states
