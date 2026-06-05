@@ -1,13 +1,31 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
+from model.qwen35.layers import GatedDeltaNet, MLP, RMSNorm
 from model.qwen35.model import ForCausalLM
 from model.qwen35.weights import load_weights
+
+
+def _compile_layers(module: torch.nn.Module, strategy: str = "basic"):
+    if strategy in {"0", "false", "none", "off"}:
+        return
+    dynamic = os.getenv("INFENG_COMPILE_DYNAMIC", "0").lower() in {"1", "true", "yes", "on"}
+    for name, child in module.named_children():
+        if isinstance(child, GatedDeltaNet):
+            continue
+        should_compile = strategy in {"basic", "mlp"} and isinstance(child, MLP)
+        should_compile |= strategy in {"basic", "rmsnorm"} and isinstance(child, RMSNorm)
+        should_compile |= strategy == "full_attention" and getattr(child, "layer_type", None) == "full_attention"
+        if should_compile:
+            setattr(module, name, torch.compile(child, mode="reduce-overhead", backend="inductor", dynamic=dynamic))
+        else:
+            _compile_layers(child, strategy)
 
 
 class InferenceEngine:
@@ -20,6 +38,7 @@ class InferenceEngine:
             self.dtype = torch.float16 if self.device.type == "mps" else torch.bfloat16
         self.model = ForCausalLM.build(config, device=self.device, dtype=self.dtype).eval()
         self.report = load_weights(self.model, weights)
+        _compile_layers(self.model, os.getenv("INFENG_COMPILE", "basic").lower())
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
         self.paged_attention = self.prefix_cache = None
 
