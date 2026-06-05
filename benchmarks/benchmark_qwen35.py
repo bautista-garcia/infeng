@@ -30,6 +30,8 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=5)
     a = p.parse_args()
+    if os.getenv("INFENG_COMPILE") in {"full_attention", "decoder", "full_decoder"}:
+        os.environ.setdefault("INFENG_STATIC_KV_LEN", str(a.prefill + a.decode))
 
     print(f"[load] weights={a.weights}", flush=True)
     engine = InferenceEngine(a.config, a.weights, a.tokenizer, device="mps", dtype=a.dtype)

@@ -31,8 +31,12 @@ class TextModel(nn.Module):
             cache = Cache.from_config(self.config)
 
         # Scan for KV cache to know current seq_len
-        cached_keys = (l.keys for l in cache.layers if getattr(l, "keys", None) is not None) if cache else ()
-        past_len = next((keys.shape[2] for keys in cached_keys), 0)
+        past_len = 0
+        for l_cache in cache.layers if cache else ():
+            if getattr(l_cache, "length", None) is not None:
+                past_len = int(l_cache.length.item()); break
+            if getattr(l_cache, "keys", None) is not None:
+                past_len = l_cache.keys.shape[2]; break
 
         # Build position_ids for new prompt
         if position_ids is None:
@@ -41,6 +45,8 @@ class TextModel(nn.Module):
 
         # Embedding + 32 decoder layers + RMSNorm
         hidden_states = self.embed_tokens(input_ids)
+        if cache:
+            cache.allocate(self.config, hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
         layer_caches = cache.layers if cache else [None] * len(self.layers)
 
         for layer, l_cache in zip(self.layers, layer_caches):

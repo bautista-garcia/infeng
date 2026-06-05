@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,18 +36,34 @@ def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
 
 @dataclass
 class FullAttentionCache:
+    max_len: int | None = None
     keys: torch.Tensor | None = None
     values: torch.Tensor | None = None
+    length: torch.Tensor | None = None
 
-    def update(self, keys: torch.Tensor, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.keys is None:
+    def allocate(self, batch_size: int, num_heads: int, head_dim: int, dtype: torch.dtype, device: torch.device):
+        if self.max_len and self.keys is None:
+            shape = (batch_size, num_heads, self.max_len, head_dim)
+            self.keys = torch.empty(shape, dtype=dtype, device=device)
+            self.values = torch.empty(shape, dtype=dtype, device=device)
+            self.length = torch.zeros((), dtype=torch.long, device=device)
+
+    def update(self, keys: torch.Tensor, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self.max_len:
+            self.allocate(keys.shape[0], keys.shape[1], keys.shape[3], keys.dtype, keys.device)
+            idx = self.length + torch.arange(keys.shape[2], device=keys.device)
+            self.keys.index_copy_(2, idx, keys)
+            self.values.index_copy_(2, idx, values)
+            self.length.add_(keys.shape[2])
+            return self.keys, self.values, torch.arange(self.max_len, device=keys.device) < self.length
+        elif self.keys is None:
             self.keys = keys
             self.values = values
         else:
             # (B, H, L, d) so we append on the token dimension
             self.keys = torch.cat((self.keys, keys), dim=2)
             self.values = torch.cat((self.values, values), dim=2)
-        return self.keys, self.values
+        return self.keys, self.values, None
 
 
 @dataclass
@@ -59,13 +76,19 @@ class DeltaNetCache:
 class Cache:
     layers: list[FullAttentionCache | DeltaNetCache]
 
+    def allocate(self, config: Any, batch_size: int, dtype: torch.dtype, device: torch.device):
+        for layer in self.layers:
+            if isinstance(layer, FullAttentionCache):
+                layer.allocate(batch_size, _get(config, "num_key_value_heads"), _get(config, "head_dim"), dtype, device)
+
     @classmethod
     def from_config(cls, config: Any) -> "Cache":
         layer_types = _get(config, "layer_types")
+        max_len = int(v) if (v := os.getenv("INFENG_STATIC_KV_LEN")) else None
         layers: list[FullAttentionCache | DeltaNetCache] = []
         for layer_type in layer_types:
             if layer_type == "full_attention":
-                layers.append(FullAttentionCache())
+                layers.append(FullAttentionCache(max_len))
             elif layer_type == "linear_attention":
                 layers.append(DeltaNetCache())
             else:
@@ -220,8 +243,9 @@ class FullAttention(nn.Module):
         # RoPE(Q, K)
         query_states, key_states = self.rotary_emb(query_states, key_states, hidden_states, position_ids)
 
+        key_mask = None
         if cache is not None:
-            key_states, value_states = cache.update(key_states, value_states)
+            key_states, value_states, key_mask = cache.update(key_states, value_states)
 
         # GQA: K & V from (B, H=4, L, D) into (B, H=16, L, D) by repeating each K, V head 4 times
         key_states = _repeat_kv(key_states, self.num_key_value_groups)
@@ -236,6 +260,11 @@ class FullAttention(nn.Module):
                 scores = scores.masked_fill(attention_mask[:, None, None, :].to(torch.bool).logical_not(), -torch.inf)
             else:
                 scores = scores + attention_mask
+        elif key_mask is not None:
+            pos_ids = position_ids[1:] if position_ids.ndim == 3 and position_ids.shape[0] == 4 else position_ids
+            pos_ids = pos_ids[0] if pos_ids.ndim == 3 else pos_ids
+            static_mask = torch.arange(key_states.shape[-2], device=key_states.device)[None, None, None, :] <= pos_ids[:, None, :, None]
+            scores = scores.masked_fill(~static_mask | ~key_mask[None, None, None, :], -torch.inf)
         else:
             q_len, k_len = query_states.shape[-2], key_states.shape[-2]
             causal_mask = torch.ones(q_len, k_len, dtype=torch.bool, device=query_states.device)
