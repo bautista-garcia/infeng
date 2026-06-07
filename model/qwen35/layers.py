@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from backend.metal import get_delta_rule_kernels
+
 
 def _get(config: Any, name: str, default: Any = None) -> Any:
     if isinstance(config, dict):
@@ -28,10 +30,6 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
-
-def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
 
 
 @dataclass
@@ -306,6 +304,7 @@ class GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.empty(self.num_v_heads).uniform_(0, 16).log_())
         self.norm = RMSNormGated(self.head_v_dim, eps=eps)
         self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
+        self.delta_rule_metal = get_delta_rule_kernels()
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None,
                 cache: DeltaNetCache | None = None) -> torch.Tensor:
@@ -363,39 +362,7 @@ class GatedDeltaNet(nn.Module):
     def _recurrent_delta_rule(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                               g: torch.Tensor, beta: torch.Tensor,
                               initial_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-        initial_dtype = query.dtype
-        query = _l2norm(query, dim=-1).transpose(1, 2).float()
-        key = _l2norm(key, dim=-1).transpose(1, 2).float()
-        value = value.transpose(1, 2).float()
-        g = g.transpose(1, 2).float()
-        beta = beta.transpose(1, 2).float()
-
-        batch_size, num_heads, seq_len, key_dim = key.shape
-        value_dim = value.shape[-1]
-        # This is the S memory matrix (B, H, Dk, Dv) 
-        shape = (batch_size, num_heads, key_dim, value_dim)
-        if initial_state is None:
-            state = torch.zeros(shape, dtype=value.dtype, device=value.device)
-        else:
-            state = initial_state.to(value)
-        output = torch.empty(batch_size, num_heads, seq_len, value_dim, dtype=value.dtype, device=value.device)
-        scale = key_dim**-0.5
-
-        for token_idx in range(seq_len):
-            q_t = query[:, :, token_idx] * scale
-            k_t = key[:, :, token_idx]
-            v_t = value[:, :, token_idx]
-            g_t = g[:, :, token_idx].exp().unsqueeze(-1).unsqueeze(-1)
-            beta_t = beta[:, :, token_idx].unsqueeze(-1)
-            state = state * g_t
-            # Value prediction: S * k_t = hat(v_t)
-            prediction = (state * k_t.unsqueeze(-1)).sum(dim=-2)
-            delta = (v_t - prediction) * beta_t
-            # Outer product broadcasts delta (B, H, Dv) with Kt (B, H, Dk) into (B, H, Dk, Dv).
-            state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-            output[:, :, token_idx] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
-
-        return output.transpose(1, 2).to(initial_dtype), state
+        return self.delta_rule_metal(query, key, value, g, beta, initial_state)
 
 
 class DecoderLayer(nn.Module):
