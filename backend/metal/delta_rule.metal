@@ -83,20 +83,20 @@ static inline void run_delta_rule_token(device half* output, device float* state
     threadgroup_barrier(mem_flags::mem_device);
 }
 
-kernel void delta_rule_prefill(device int* launch [[buffer(0)]], device half* output [[buffer(1)]],
-                               device float* state [[buffer(2)]], device const half* query [[buffer(3)]],
-                               device const half* key [[buffer(4)]], device const half* value [[buffer(5)]],
-                               device const float* g [[buffer(6)]], device const half* beta [[buffer(7)]],
-                               device const float* state_in [[buffer(8)]], constant long& batch_size [[buffer(9)]],
-                               constant long& seq_len [[buffer(10)]], constant long& num_heads [[buffer(11)]],
-                               constant long& vs0 [[buffer(12)]], constant long& vs1 [[buffer(13)]],
-                               constant long& vs2 [[buffer(14)]], constant long& vs3 [[buffer(15)]],
-                               constant bool& has_initial_state [[buffer(16)]], uint3 gid [[thread_position_in_grid]],
+[[max_total_threads_per_threadgroup(1024)]]
+kernel void delta_rule_prefill(device half* output [[buffer(0)]],
+                               device float* state [[buffer(1)]], device const half* query [[buffer(2)]],
+                               device const half* key [[buffer(3)]], device const half* value [[buffer(4)]],
+                               device const float* g [[buffer(5)]], device const half* beta [[buffer(6)]],
+                               device const float* state_in [[buffer(7)]], constant long& batch_size [[buffer(8)]],
+                               constant long& seq_len [[buffer(9)]], constant long& num_heads [[buffer(10)]],
+                               constant long& vs0 [[buffer(11)]], constant long& vs1 [[buffer(12)]],
+                               constant long& vs2 [[buffer(13)]], constant long& vs3 [[buffer(14)]],
+                               constant bool& has_initial_state [[buffer(15)]], uint3 gid [[thread_position_in_grid]],
                                uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
     uint lane = lane3.x;
     long group = group3.x;
     if (group >= batch_size * num_heads) return;
-    launch[gid.x] = int(gid.x);
     long b = group / num_heads, h = group - b * num_heads;
     threadgroup float q[D], k[D], delta[D], scratch[1024];
     for (uint i = lane; i < D * D; i += 1024) {
@@ -109,20 +109,20 @@ kernel void delta_rule_prefill(device int* launch [[buffer(0)]], device half* ou
 }
 
 // One threadgroup per (B, n_heads)
-kernel void delta_rule_decode(device int* launch [[buffer(0)]], device half* output [[buffer(1)]],
-                              device float* state [[buffer(2)]], device const half* query [[buffer(3)]],
-                              device const half* key [[buffer(4)]], device const half* value [[buffer(5)]],
-                              device const float* g [[buffer(6)]], device const half* beta [[buffer(7)]],
-                              device const float* state_in [[buffer(8)]], constant long& batch_size [[buffer(9)]],
-                              constant long& seq_len [[buffer(10)]], constant long& num_heads [[buffer(11)]],
-                              constant long& vs0 [[buffer(12)]], constant long& vs1 [[buffer(13)]],
-                              constant long& vs2 [[buffer(14)]], constant long& vs3 [[buffer(15)]],
-                              constant bool& has_initial_state [[buffer(16)]], uint3 gid [[thread_position_in_grid]],
+[[max_total_threads_per_threadgroup(1024)]]
+kernel void delta_rule_decode(device half* output [[buffer(0)]],
+                              device float* state [[buffer(1)]], device const half* query [[buffer(2)]],
+                              device const half* key [[buffer(3)]], device const half* value [[buffer(4)]],
+                              device const float* g [[buffer(5)]], device const half* beta [[buffer(6)]],
+                              device const float* state_in [[buffer(7)]], constant long& batch_size [[buffer(8)]],
+                              constant long& seq_len [[buffer(9)]], constant long& num_heads [[buffer(10)]],
+                              constant long& vs0 [[buffer(11)]], constant long& vs1 [[buffer(12)]],
+                              constant long& vs2 [[buffer(13)]], constant long& vs3 [[buffer(14)]],
+                              constant bool& has_initial_state [[buffer(15)]], uint3 gid [[thread_position_in_grid]],
                               uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
     uint lane = lane3.x;
     long group = group3.x;
     if (group >= batch_size * num_heads) return;
-    launch[gid.x] = int(gid.x);
     long b = group / num_heads, h = group - b * num_heads;
     threadgroup float q[D], k[D], delta[D], scratch[1024];
     for (uint i = lane; i < D * D; i += 1024) {
