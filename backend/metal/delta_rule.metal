@@ -21,29 +21,29 @@ static inline void run_delta_rule_token(device half* output, device float* state
                                         long vs0, long vs1, long vs2, long vs3, uint lane, uint simd_lane,
                                         uint simd_group, threadgroup float* q, threadgroup float* k,
                                         threadgroup float* delta, threadgroup float* scratch) {
-    // Parallel reduction ()
-    float q2 = 0.0f, k2 = 0.0f;
-    if (lane < D) {
+    if (simd_group < D / 32) {
         float qv = float(query[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
         float kv = float(key[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
-        q[lane] = qv; k[lane] = kv; q2 = qv * qv; k2 = kv * kv;
-    }
-    float q_partial = simd_sum(q2), k_partial = simd_sum(k2);
-    if (simd_lane == 0) {
-        scratch[simd_group] = q_partial;
-        scratch[D + simd_group] = k_partial;
+        q[lane] = qv; k[lane] = kv;
+        float q_partial = simd_sum(qv * qv), k_partial = simd_sum(kv * kv);
+        if (simd_lane == 0) {
+            scratch[simd_group] = q_partial;
+            scratch[D / 32 + simd_group] = k_partial;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float q_total = simd_sum(simd_group == 0 ? scratch[lane] : 0.0f);
-    float k_total = simd_sum(simd_group == 0 ? scratch[D + lane] : 0.0f);
-    if (lane == 0) {
-        scratch[0] = q_total;
-        scratch[D] = k_total;
+    if (simd_group == 0) {
+        float q_total = simd_sum(simd_lane < D / 32 ? scratch[simd_lane] : 0.0f);
+        float k_total = simd_sum(simd_lane < D / 32 ? scratch[D / 32 + simd_lane] : 0.0f);
+        if (simd_lane == 0) {
+            scratch[0] = q_total;
+            scratch[1] = k_total;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float q_norm = rsqrt(scratch[0] + 1.0e-6f) * 0.08838834764831845f;
-    float k_norm = rsqrt(scratch[D] + 1.0e-6f);
-    if (lane < D) {
+    float k_norm = rsqrt(scratch[1] + 1.0e-6f);
+    if (simd_group < D / 32) {
         q[lane] *= q_norm;
         k[lane] *= k_norm;
     }
