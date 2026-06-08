@@ -18,31 +18,31 @@ static inline long value_offset(long b, long t, long h, long d, long s0, long s1
 static inline void run_delta_rule_token(device half* output, device float* state, device const half* query,
                                         device const half* key, device const half* value, device const float* g,
                                         device const half* beta, long b, long t, long h, long seq_len, long num_heads,
-                                        long vs0, long vs1, long vs2, long vs3, uint lane, threadgroup float* q,
-                                        threadgroup float* k, threadgroup float* delta, threadgroup float* scratch) {
-    // Parallel tree reduction (k_norm & q_norm)
-    float local = 0.0f;
+                                        long vs0, long vs1, long vs2, long vs3, uint lane, uint simd_lane,
+                                        uint simd_group, threadgroup float* q, threadgroup float* k,
+                                        threadgroup float* delta, threadgroup float* scratch) {
+    // Parallel reduction ()
+    float q2 = 0.0f, k2 = 0.0f;
     if (lane < D) {
         float qv = float(query[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
         float kv = float(key[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
-        q[lane] = qv; k[lane] = kv; local = qv * qv;
+        q[lane] = qv; k[lane] = kv; q2 = qv * qv; k2 = kv * kv;
     }
-    scratch[lane] = local;
+    float q_partial = simd_sum(q2), k_partial = simd_sum(k2);
+    if (simd_lane == 0) {
+        scratch[simd_group] = q_partial;
+        scratch[D + simd_group] = k_partial;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 512; stride; stride >>= 1) {
-        if (lane < stride) scratch[lane] += scratch[lane + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_total = simd_sum(simd_group == 0 ? scratch[lane] : 0.0f);
+    float k_total = simd_sum(simd_group == 0 ? scratch[D + lane] : 0.0f);
+    if (lane == 0) {
+        scratch[0] = q_total;
+        scratch[D] = k_total;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float q_norm = rsqrt(scratch[0] + 1.0e-6f) * 0.08838834764831845f;
-
-    local = lane < D ? k[lane] * k[lane] : 0.0f;
-    scratch[lane] = local;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 512; stride; stride >>= 1) {
-        if (lane < stride) scratch[lane] += scratch[lane + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float k_norm = rsqrt(scratch[0] + 1.0e-6f);
+    float k_norm = rsqrt(scratch[D] + 1.0e-6f);
     if (lane < D) {
         q[lane] *= q_norm;
         k[lane] *= k_norm;
@@ -93,7 +93,8 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                                constant long& num_heads [[buffer(9)]], constant long& vs0 [[buffer(10)]],
                                constant long& vs1 [[buffer(11)]], constant long& vs2 [[buffer(12)]],
                                constant long& vs3 [[buffer(13)]], constant bool& has_initial_state [[buffer(14)]],
-                               uint3 gid [[thread_position_in_grid]],
+                               uint3 gid [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                               uint simd_group [[simdgroup_index_in_threadgroup]],
                                uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
     uint lane = lane3.x;
     long group = group3.x;
@@ -106,7 +107,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_device);
     }
     for (long t = 0; t < seq_len; ++t)
-        run_delta_rule_token(output, state, query, key, value, g, beta, b, t, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, q, k, delta, scratch);
+        run_delta_rule_token(output, state, query, key, value, g, beta, b, t, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, simd_lane, simd_group, q, k, delta, scratch);
 }
 
 // One threadgroup per (B, n_heads)
@@ -119,7 +120,8 @@ kernel void delta_rule_decode(device half* output [[buffer(0)]],
                               constant long& num_heads [[buffer(9)]], constant long& vs0 [[buffer(10)]],
                               constant long& vs1 [[buffer(11)]], constant long& vs2 [[buffer(12)]],
                               constant long& vs3 [[buffer(13)]], constant bool& has_initial_state [[buffer(14)]],
-                              uint3 gid [[thread_position_in_grid]],
+                              uint3 gid [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                              uint simd_group [[simdgroup_index_in_threadgroup]],
                               uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
     uint lane = lane3.x;
     long group = group3.x;
@@ -132,5 +134,5 @@ kernel void delta_rule_decode(device half* output [[buffer(0)]],
             state[state_offset(b, h, i / D, i % D, num_heads)] = 0.0f;
         threadgroup_barrier(mem_flags::mem_device);
     }
-    run_delta_rule_token(output, state, query, key, value, g, beta, b, 0, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, q, k, delta, scratch);
+    run_delta_rule_token(output, state, query, key, value, g, beta, b, 0, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, simd_lane, simd_group, q, k, delta, scratch);
 }
