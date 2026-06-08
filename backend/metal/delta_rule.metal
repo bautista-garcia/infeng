@@ -88,21 +88,20 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                                device float* state [[buffer(1)]], device const half* query [[buffer(2)]],
                                device const half* key [[buffer(3)]], device const half* value [[buffer(4)]],
                                device const float* g [[buffer(5)]], device const half* beta [[buffer(6)]],
-                               device const float* state_in [[buffer(7)]], constant long& batch_size [[buffer(8)]],
-                               constant long& seq_len [[buffer(9)]], constant long& num_heads [[buffer(10)]],
-                               constant long& vs0 [[buffer(11)]], constant long& vs1 [[buffer(12)]],
-                               constant long& vs2 [[buffer(13)]], constant long& vs3 [[buffer(14)]],
-                               constant bool& has_initial_state [[buffer(15)]], uint3 gid [[thread_position_in_grid]],
+                               constant long& batch_size [[buffer(7)]], constant long& seq_len [[buffer(8)]],
+                               constant long& num_heads [[buffer(9)]], constant long& vs0 [[buffer(10)]],
+                               constant long& vs1 [[buffer(11)]], constant long& vs2 [[buffer(12)]],
+                               constant long& vs3 [[buffer(13)]], constant bool& has_initial_state [[buffer(14)]],
+                               uint3 gid [[thread_position_in_grid]],
                                uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
     uint lane = lane3.x;
     long group = group3.x;
     if (group >= batch_size * num_heads) return;
     long b = group / num_heads, h = group - b * num_heads;
     threadgroup float q[D], k[D], delta[D], scratch[1024];
-    for (uint i = lane; i < D * D; i += 1024) {
-        long off = state_offset(b, h, i / D, i % D, num_heads);
-        state[off] = has_initial_state ? state_in[off] : 0.0f;
-    }
+    if (!has_initial_state)
+        for (uint i = lane; i < D * D; i += 1024)
+            state[state_offset(b, h, i / D, i % D, num_heads)] = 0.0f;
     threadgroup_barrier(mem_flags::mem_device);
     for (long t = 0; t < seq_len; ++t)
         run_delta_rule_token(output, state, query, key, value, g, beta, b, t, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, q, k, delta, scratch);
@@ -114,21 +113,20 @@ kernel void delta_rule_decode(device half* output [[buffer(0)]],
                               device float* state [[buffer(1)]], device const half* query [[buffer(2)]],
                               device const half* key [[buffer(3)]], device const half* value [[buffer(4)]],
                               device const float* g [[buffer(5)]], device const half* beta [[buffer(6)]],
-                              device const float* state_in [[buffer(7)]], constant long& batch_size [[buffer(8)]],
-                              constant long& seq_len [[buffer(9)]], constant long& num_heads [[buffer(10)]],
-                              constant long& vs0 [[buffer(11)]], constant long& vs1 [[buffer(12)]],
-                              constant long& vs2 [[buffer(13)]], constant long& vs3 [[buffer(14)]],
-                              constant bool& has_initial_state [[buffer(15)]], uint3 gid [[thread_position_in_grid]],
+                              constant long& batch_size [[buffer(7)]], constant long& seq_len [[buffer(8)]],
+                              constant long& num_heads [[buffer(9)]], constant long& vs0 [[buffer(10)]],
+                              constant long& vs1 [[buffer(11)]], constant long& vs2 [[buffer(12)]],
+                              constant long& vs3 [[buffer(13)]], constant bool& has_initial_state [[buffer(14)]],
+                              uint3 gid [[thread_position_in_grid]],
                               uint3 lane3 [[thread_position_in_threadgroup]], uint3 group3 [[threadgroup_position_in_grid]]) {
     uint lane = lane3.x;
     long group = group3.x;
     if (group >= batch_size * num_heads) return;
     long b = group / num_heads, h = group - b * num_heads;
     threadgroup float q[D], k[D], delta[D], scratch[1024];
-    for (uint i = lane; i < D * D; i += 1024) {
-        long off = state_offset(b, h, i / D, i % D, num_heads);
-        state[off] = has_initial_state ? state_in[off] : 0.0f;
-    }
+    if (!has_initial_state)
+        for (uint i = lane; i < D * D; i += 1024)
+            state[state_offset(b, h, i / D, i % D, num_heads)] = 0.0f;
     threadgroup_barrier(mem_flags::mem_device);
     run_delta_rule_token(output, state, query, key, value, g, beta, b, 0, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, q, k, delta, scratch);
 }

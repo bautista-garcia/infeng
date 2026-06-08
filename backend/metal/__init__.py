@@ -35,13 +35,13 @@ class DeltaRuleKernels:
             raise RuntimeError(f"Metal delta rule initial_state must be fp32 mps with shape {(batch_size, num_heads, 128, 128)}")
 
         output = torch.empty_like(value, memory_format=torch.contiguous_format)
-        state = torch.empty((batch_size, num_heads, 128, 128), dtype=torch.float32, device=query.device)
-        state_in = state if initial_state is None else initial_state
+        state = initial_state if initial_state is not None else torch.empty((batch_size, num_heads, 128, 128),
+                                                                            dtype=torch.float32, device=query.device)
         groups = batch_size * num_heads
         threads = [groups * 1024, 1, 1]
         group_size = [1024, 1, 1]
-        args = (output, state, query, key, value, g, beta, state_in, batch_size, seq_len, num_heads,
-                value.stride(0), value.stride(1), value.stride(2), value.stride(3), initial_state is not None)
+        args = (output, state, query, key, value, g, beta, batch_size, seq_len, num_heads, value.stride(0),
+                value.stride(1), value.stride(2), value.stride(3), initial_state is not None)
         (self.lib.delta_rule_decode if seq_len == 1 else self.lib.delta_rule_prefill)(*args, threads=threads,
                                                                                       group_size=group_size)
         return output, state
