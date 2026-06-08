@@ -108,6 +108,7 @@ kernel void delta_rule_prefill(device int* launch [[buffer(0)]], device half* ou
         run_delta_rule_token(output, state, query, key, value, g, beta, b, t, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, q, k, delta, scratch);
 }
 
+// One threadgroup per (B, n_heads)
 kernel void delta_rule_decode(device int* launch [[buffer(0)]], device half* output [[buffer(1)]],
                               device float* state [[buffer(2)]], device const half* query [[buffer(3)]],
                               device const half* key [[buffer(4)]], device const half* value [[buffer(5)]],

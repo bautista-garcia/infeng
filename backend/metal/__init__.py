@@ -36,7 +36,7 @@ class DeltaRuleKernels:
 
         output = torch.empty_like(value, memory_format=torch.contiguous_format)
         state = torch.empty((batch_size, num_heads, 128, 128), dtype=torch.float32, device=query.device)
-        launch = torch.empty(batch_size * num_heads * 1024, dtype=torch.int32, device=query.device)
+        launch = torch.empty(batch_size * num_heads, dtype=torch.int32, device=query.device)
         state_in = state if initial_state is None else initial_state
         args = (launch, output, state, query, key, value, g, beta, state_in, batch_size, seq_len, num_heads,
                 value.stride(0), value.stride(1), value.stride(2), value.stride(3), initial_state is not None)
