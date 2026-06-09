@@ -41,9 +41,9 @@ static inline void run_delta_rule_token(device half* output, device float* state
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float q_norm = rsqrt(scratch[0] + 1.0e-6f) * 0.08838834764831845f;
-    float k_norm = rsqrt(scratch[1] + 1.0e-6f);
     if (simd_group < D / 32) {
+        float q_norm = rsqrt(scratch[0] + 1.0e-6f) * 0.08838834764831845f;
+        float k_norm = rsqrt(scratch[1] + 1.0e-6f);
         q[lane] *= q_norm;
         k[lane] *= k_norm;
     }
