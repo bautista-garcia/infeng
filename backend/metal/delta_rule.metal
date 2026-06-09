@@ -50,38 +50,60 @@ static inline void run_delta_rule_token(device half* output, device float* state
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Decay + Prediction (v = kt @ St-1 * decay)
     uint vv = lane & 127, part = lane >> 7;
-    float prediction = 0.0f, decay = exp(g[(b * seq_len + t) * num_heads + h]);
+    long base_offset = state_offset(b, h, 0, vv, num_heads);
+    long row_stride  = state_offset(b, h, 1, vv, num_heads) - base_offset;
+    long loop_stride = 8 * row_stride; 
+    
+    long off = base_offset + (part * row_stride);
+    float prediction = 0.0f;
+    float decay = exp(g[(b * seq_len + t) * num_heads + h]);
+    
     for (uint kk = part; kk < D; kk += 8) {
-            long off = state_offset(b, h, kk, vv, num_heads);
-            float s = state[off] * decay;
-            state[off] = s;
-            prediction += s * k[kk];
+        float s = state[off] * decay;
+        state[off] = s;             
+        prediction += s * k[kk];
+        off += loop_stride;
     }
     scratch[lane] = prediction;
-    threadgroup_barrier(mem_flags::mem_device);
-    // Delta S * Beta 
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The first row of 128 threads reduce the 8 partials that summed give v[lane]
     if (part == 0) {
-        float pred = 0.0f;
-        for (uint p = 0; p < 8; ++p) pred += scratch[p * D + vv];
+        float pred = scratch[0 * 128 + vv] + scratch[1 * 128 + vv] + 
+                     scratch[2 * 128 + vv] + scratch[3 * 128 + vv] +
+                     scratch[4 * 128 + vv] + scratch[5 * 128 + vv] + 
+                     scratch[6 * 128 + vv] + scratch[7 * 128 + vv];
+                     
         delta[vv] = (float(value[value_offset(b, t, h, vv, vs0, vs1, vs2, vs3)]) - pred) * float(beta[(b * seq_len + t) * num_heads + h]);
     }
+    
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // State matrix update
-    for (uint kk = part; kk < D; kk += 8)
-        state[state_offset(b, h, kk, vv, num_heads)] += k[kk] * delta[vv];
-    threadgroup_barrier(mem_flags::mem_device);
-    // Output projection
+
     float out = 0.0f;
-    for (uint kk = part; kk < D; kk += 8)
-        out += state[state_offset(b, h, kk, vv, num_heads)] * q[kk];
+    float cached_delta = delta[vv]; // Cache into local register execution space
+    off = base_offset + (part * row_stride); // Reset memory pointer to the top row
+
+    for (uint kk = part; kk < D; kk += 8) {
+        // Outer product
+        float s = state[off]; 
+        s += k[kk] * cached_delta;
+        state[off] = s; 
+
+        // Output projection matmul
+        out += s * q[kk]; 
+        off += loop_stride; // (1024) for (8,128) blocks
+    }
     scratch[lane] = out;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Same reduction as above
     if (part == 0) {
-        float total = 0.0f;
-        for (uint p = 0; p < 8; ++p) total += scratch[p * D + vv];
+        float total = scratch[0 * 128 + vv] + scratch[1 * 128 + vv] + 
+                      scratch[2 * 128 + vv] + scratch[3 * 128 + vv] +
+                      scratch[4 * 128 + vv] + scratch[5 * 128 + vv] + 
+                      scratch[6 * 128 + vv] + scratch[7 * 128 + vv];
+                      
         output[qkv_offset(b, t, h, vv, seq_len, num_heads)] = half(total);
     }
-    threadgroup_barrier(mem_flags::mem_device);
+    
 }
 
 [[max_total_threads_per_threadgroup(1024)]]
