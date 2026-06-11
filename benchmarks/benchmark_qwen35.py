@@ -17,6 +17,9 @@ from runtime.inference import InferenceEngine
 WEIGHTS = ROOT / "weights/unsloth-Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-BF16.gguf"
 BANDWIDTH_BPS, FLOPS = 200e9, 13.6e12
 
+# For a tinygrad comparison:
+# JITBEAM=2 python -c 'import sys, runpy; sys.setrecursionlimit(100000); import sys as s; s.argv=["tinygrad/llm/cli.py","--model","qwen3.5:4b","--warmup","--benchmark"]; runpy.run_path("tinygrad/llm/cli.py", run_name="__main__")'
+
 
 def main():
     p = argparse.ArgumentParser(description="Qwen3.5 MPS macro benchmark")
