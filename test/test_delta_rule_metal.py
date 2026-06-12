@@ -22,7 +22,7 @@ def _prefill(kernels, q, k, v, g, beta, initial_state):
                                                                         dtype=torch.float32, device=q.device)
     args = (output, state, q, k, v, g, beta, batch_size, seq_len, num_heads, v.stride(0), v.stride(1), v.stride(2),
             v.stride(3), initial_state is not None)
-    kernels.lib.delta_rule_prefill(*args, threads=[batch_size * num_heads * 128, 1, 1], group_size=[128, 1, 1])
+    kernels.lib.delta_rule_prefill(*args, threads=[batch_size * num_heads * 1024, 1, 1], group_size=[1024, 1, 1])
     return output, state
 
 

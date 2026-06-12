@@ -38,9 +38,8 @@ class DeltaRuleKernels:
         state = initial_state if initial_state is not None else torch.empty((batch_size, num_heads, 128, 128),
                                                                             dtype=torch.float32, device=query.device)
         groups = batch_size * num_heads
-        group_width = 1024 if seq_len == 1 else 128
-        threads = [groups * group_width, 1, 1]
-        group_size = [group_width, 1, 1]
+        threads = [groups * 1024, 1, 1]
+        group_size = [1024, 1, 1]
         args = (output, state, query, key, value, g, beta, batch_size, seq_len, num_heads, value.stride(0),
                 value.stride(1), value.stride(2), value.stride(3), initial_state is not None)
         (self.lib.delta_rule_decode if seq_len == 1 else self.lib.delta_rule_prefill)(*args, threads=threads,
