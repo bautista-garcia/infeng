@@ -59,3 +59,5 @@ weights/
 skills-lock.json
 
 .agents/
+
+profile/out/
