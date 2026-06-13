@@ -37,13 +37,20 @@ class DeltaRuleKernels:
         output = torch.empty_like(value, memory_format=torch.contiguous_format)
         state = initial_state if initial_state is not None else torch.empty((batch_size, num_heads, 128, 128),
                                                                             dtype=torch.float32, device=query.device)
-        groups = batch_size * num_heads
-        threads = [groups * 1024, 1, 1]
-        group_size = [1024, 1, 1]
         args = (output, state, query, key, value, g, beta, batch_size, seq_len, num_heads, value.stride(0),
                 value.stride(1), value.stride(2), value.stride(3), initial_state is not None)
-        (self.lib.delta_rule_decode if seq_len == 1 else self.lib.delta_rule_prefill)(*args, threads=threads,
-                                                                                      group_size=group_size)
+        if seq_len == 1:
+            self.lib.delta_rule_decode(*args, threads=[batch_size * num_heads * 1024, 1, 1], group_size=[1024, 1, 1])
+        else:
+            for start in range(0, seq_len, 64):
+                end = min(start + 64, seq_len)
+                q, k, v, gg, bb = (x[:, start:end].contiguous() for x in (query, key, value, g, beta))
+                out = torch.empty_like(v, memory_format=torch.contiguous_format)
+                chunk_args = (out, state, q, k, v, gg, bb, batch_size, end - start, num_heads, v.stride(0),
+                              v.stride(1), v.stride(2), v.stride(3), initial_state is not None or start > 0)
+                self.lib.delta_rule_prefill(*chunk_args, threads=[128, batch_size * num_heads, 1],
+                                            group_size=[128, 1, 1])
+                output[:, start:end].copy_(out)
         return output, state
 
 

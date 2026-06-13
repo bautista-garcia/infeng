@@ -20,9 +20,14 @@ def _prefill(kernels, q, k, v, g, beta, initial_state):
     output = torch.empty_like(v, memory_format=torch.contiguous_format)
     state = initial_state if initial_state is not None else torch.empty((batch_size, num_heads, 128, 128),
                                                                         dtype=torch.float32, device=q.device)
-    args = (output, state, q, k, v, g, beta, batch_size, seq_len, num_heads, v.stride(0), v.stride(1), v.stride(2),
-            v.stride(3), initial_state is not None)
-    kernels.lib.delta_rule_prefill(*args, threads=[batch_size * num_heads * 1024, 1, 1], group_size=[1024, 1, 1])
+    for start in range(0, seq_len, 64):
+        end = min(start + 64, seq_len)
+        qq, kk, vv, gg, bb = (x[:, start:end].contiguous() for x in (q, k, v, g, beta))
+        out = torch.empty_like(vv, memory_format=torch.contiguous_format)
+        args = (out, state, qq, kk, vv, gg, bb, batch_size, end - start, num_heads, vv.stride(0), vv.stride(1),
+                vv.stride(2), vv.stride(3), initial_state is not None or start > 0)
+        kernels.lib.delta_rule_prefill(*args, threads=[128, batch_size * num_heads, 1], group_size=[128, 1, 1])
+        output[:, start:end].copy_(out)
     return output, state
 
 

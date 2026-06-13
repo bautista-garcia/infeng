@@ -1,0 +1,1 @@
+- Gated delta net prefill version must implement the chunkwise version. The sequential version may seem faster but that is because the parallel chunkwise isn't yet fully optimized.
