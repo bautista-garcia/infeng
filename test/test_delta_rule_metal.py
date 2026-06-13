@@ -20,8 +20,8 @@ def _prefill(kernels, q, k, v, g, beta, initial_state):
     output = torch.empty_like(v, memory_format=torch.contiguous_format)
     state = initial_state if initial_state is not None else torch.empty((batch_size, num_heads, 128, 128),
                                                                         dtype=torch.float32, device=q.device)
-    for start in range(0, seq_len, 64):
-        end = min(start + 64, seq_len)
+    for start in range(0, seq_len, 32):
+        end = min(start + 32, seq_len)
         qq, kk, vv, gg, bb = (x[:, start:end].contiguous() for x in (q, k, v, g, beta))
         out = torch.empty_like(vv, memory_format=torch.contiguous_format)
         args = (out, state, qq, kk, vv, gg, bb, batch_size, end - start, num_heads, vv.stride(0), vv.stride(1),

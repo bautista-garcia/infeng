@@ -42,8 +42,8 @@ class DeltaRuleKernels:
         if seq_len == 1:
             self.lib.delta_rule_decode(*args, threads=[batch_size * num_heads * 1024, 1, 1], group_size=[1024, 1, 1])
         else:
-            for start in range(0, seq_len, 64):
-                end = min(start + 64, seq_len)
+            for start in range(0, seq_len, 32):
+                end = min(start + 32, seq_len)
                 q, k, v, gg, bb = (x[:, start:end].contiguous() for x in (query, key, value, g, beta))
                 out = torch.empty_like(v, memory_format=torch.contiguous_format)
                 chunk_args = (out, state, q, k, v, gg, bb, batch_size, end - start, num_heads, v.stride(0),

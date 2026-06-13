@@ -1,1 +1,3 @@
 - Gated delta net prefill version must implement the chunkwise version. The sequential version may seem faster but that is because the parallel chunkwise isn't yet fully optimized.
+- Use simdgroup_matrix types, they yield higher FLOPs count (similar to Tensor Cores in NVIDIA architectures).
+- The model attempts fast paths, i.e: reducing chunk_size to overfit for the current benchmark. 
