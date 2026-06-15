@@ -250,28 +250,8 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
             w_tile[(idx % D_PREFILL_TILE) * C_PREFILL + i] = k_tile[idx];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // (32,32) tile -> 16 (8,8) tiles:
-        // 4 outer products that compute (K @ K^T; Q @ K^T)
-        for (uint block = simd_group; block < 16; block += 4) {
-            uint ib = (block >> 2) << 3, jb = (block & 3) << 3;
-            simdgroup_matrix<half, 8, 8> a, b, kk_acc, qk_acc;
-            if (d0 == 0) {
-                kk_acc = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
-                qk_acc = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
-            } else {
-                simdgroup_load(kk_acc, l_tile, C_PREFILL, ulong2(jb, ib));
-                simdgroup_load(qk_acc, qk_tile, C_PREFILL, ulong2(jb, ib));
-            }
-            for (uint ko = 0; ko < D_PREFILL_TILE; ko += 8) {
-                simdgroup_load(b, w_tile, C_PREFILL, ulong2(jb, ko));
-                simdgroup_load(a, k_tile, D_PREFILL_TILE, ulong2(ko, ib));
-                simdgroup_multiply_accumulate(kk_acc, a, b, kk_acc);
-                simdgroup_load(a, u_tile, D_PREFILL_TILE, ulong2(ko, ib));
-                simdgroup_multiply_accumulate(qk_acc, a, b, qk_acc);
-            }
-            simdgroup_store(kk_acc, l_tile, C_PREFILL, ulong2(jb, ib));
-            simdgroup_store(qk_acc, qk_tile, C_PREFILL, ulong2(jb, ib));
-        }
+        mma32x32(l_tile, k_tile, w_tile, scratch, simd_lane, simd_group, d0 != 0);
+        mma32x32(qk_tile, u_tile, w_tile, scratch, simd_lane, simd_group, d0 != 0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     // Lw = strictLower(-diag(beta) K K^T), A_local = causalLower(Gamma o (Q K^T)).
