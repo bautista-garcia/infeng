@@ -75,12 +75,11 @@ static inline void run_delta_rule_token(device half* output, device float* state
                                         device const half* key, device const half* value, device const float* g,
                                         device const half* beta, long b, long t, long h, long seq_len, long num_heads,
                                         long vs0, long vs1, long vs2, long vs3, uint lane, uint simd_lane,
-                                        uint simd_group, threadgroup float* q, threadgroup float* k,
-                                        threadgroup float* delta, threadgroup float* scratch) {
+                                        uint simd_group, threadgroup half* q, threadgroup half* k, threadgroup float* scratch) {
+    float qv = 0.0f, kv = 0.0f;
     if (simd_group < D / 32) {
-        float qv = float(query[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
-        float kv = float(key[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
-        q[lane] = qv; k[lane] = kv;
+        qv = float(query[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
+        kv = float(key[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
         float q_partial = simd_sum(qv * qv), k_partial = simd_sum(kv * kv), qk_partial = simd_sum(qv * kv);
         if (simd_lane == 0) {
             scratch[simd_group] = q_partial;
@@ -104,8 +103,8 @@ static inline void run_delta_rule_token(device half* output, device float* state
         float q_norm = rsqrt(scratch[0] + 1.0e-6f) * 0.08838834764831845f;
         float k_norm = rsqrt(scratch[1] + 1.0e-6f);
         if (lane == 0) scratch[1024] *= q_norm * k_norm;
-        q[lane] *= q_norm;
-        k[lane] *= k_norm;
+        q[lane] = half(qv * q_norm);
+        k[lane] = half(kv * k_norm);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Decay + Prediction (v = kt @ St-1 * decay)
@@ -118,12 +117,13 @@ static inline void run_delta_rule_token(device half* output, device float* state
     float prediction = 0.0f, q_state = 0.0f;
     float decay = exp(g[(b * seq_len + t) * num_heads + h]);
     
-    for (uint kk = part; kk < D; kk += DECODE_PARTS) {
-        float s = state[off] * decay;
-        state[off] = s;             
-        prediction += s * k[kk];
-        q_state += s * q[kk];
-        off += loop_stride;
+    for (uint kk = part; kk < D; kk += DECODE_PARTS * 4) {
+        float s0 = state[off] * decay, s1 = state[off + loop_stride] * decay;
+        float s2 = state[off + loop_stride * 2] * decay, s3 = state[off + loop_stride * 3] * decay;
+        state[off] = s0; state[off + loop_stride] = s1; state[off + loop_stride * 2] = s2; state[off + loop_stride * 3] = s3;
+        prediction += s0 * float(k[kk]) + s1 * float(k[kk + DECODE_PARTS]) + s2 * float(k[kk + DECODE_PARTS * 2]) + s3 * float(k[kk + DECODE_PARTS * 3]);
+        q_state += s0 * float(q[kk]) + s1 * float(q[kk + DECODE_PARTS]) + s2 * float(q[kk + DECODE_PARTS * 2]) + s3 * float(q[kk + DECODE_PARTS * 3]);
+        off += loop_stride * 4;
     }
     scratch[lane] = prediction;
     scratch[512 + lane] = q_state;
@@ -135,21 +135,20 @@ static inline void run_delta_rule_token(device half* output, device float* state
         float cached_delta = (float(value[value_offset(b, t, h, vv, vs0, vs1, vs2, vs3)]) - pred) * float(beta[(b * seq_len + t) * num_heads + h]);
         float q_total = scratch[512 + 0 * 128 + vv] + scratch[512 + 1 * 128 + vv] +
                         scratch[512 + 2 * 128 + vv] + scratch[512 + 3 * 128 + vv];
-        delta[vv] = cached_delta;
+        scratch[vv] = cached_delta;
         output[qkv_offset(b, t, h, vv, seq_len, num_heads)] = half(q_total + cached_delta * scratch[1024]);
     }
     
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float cached_delta = delta[vv]; // Cache into local register execution space
+    float cached_delta = scratch[vv]; // Cache into local register execution space
     off = base_offset + (part * row_stride); // Reset memory pointer to the top row
 
-    for (uint kk = part; kk < D; kk += DECODE_PARTS) {
-        // Outer product
-        float s = state[off]; 
-        s += k[kk] * cached_delta;
-        state[off] = s; 
-        off += loop_stride;
+    for (uint kk = part; kk < D; kk += DECODE_PARTS * 4) {
+        float s0 = state[off] + float(k[kk]) * cached_delta, s1 = state[off + loop_stride] + float(k[kk + DECODE_PARTS]) * cached_delta;
+        float s2 = state[off + loop_stride * 2] + float(k[kk + DECODE_PARTS * 2]) * cached_delta, s3 = state[off + loop_stride * 3] + float(k[kk + DECODE_PARTS * 3]) * cached_delta;
+        state[off] = s0; state[off + loop_stride] = s1; state[off + loop_stride * 2] = s2; state[off + loop_stride * 3] = s3;
+        off += loop_stride * 4;
     }
 }
 
@@ -347,12 +346,13 @@ kernel void delta_rule_decode(device half* output [[buffer(0)]],
     long group = group3.x;
     if (group >= batch_size * num_heads) return;
     long b = group / num_heads, h = group - b * num_heads;
-    threadgroup float q[D], k[D], delta[D], scratch[1025];
+    threadgroup half q[D], k[D];
+    threadgroup float scratch[1025];
     // No divergence: all threads evaluate to same (no risk in barrier inside if)
     if (!has_initial_state) {
         for (uint i = lane; i < D * D; i += 512)
             state[state_offset(b, h, i / D, i % D, num_heads)] = 0.0f;
         threadgroup_barrier(mem_flags::mem_device);
     }
-    run_delta_rule_token(output, state, query, key, value, g, beta, b, 0, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, simd_lane, simd_group, q, k, delta, scratch);
+    run_delta_rule_token(output, state, query, key, value, g, beta, b, 0, h, seq_len, num_heads, vs0, vs1, vs2, vs3, lane, simd_lane, simd_group, q, k, scratch);
 }

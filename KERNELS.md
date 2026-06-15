@@ -18,6 +18,8 @@ Your workflow has to be:
 - Keep global memory writes vectorized/coalesced and use SRAM staging for transposes that feed matrix fragments repeatedly.
 
 ## Decode Kernels
+- Unroll loops.
+- Use threadgroup memory as much as possible.
 
 
 
