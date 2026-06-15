@@ -40,7 +40,7 @@ class DeltaRuleKernels:
         args = (output, state, query, key, value, g, beta, batch_size, seq_len, num_heads, value.stride(0),
                 value.stride(1), value.stride(2), value.stride(3), initial_state is not None)
         if seq_len == 1:
-            self.lib.delta_rule_decode(*args, threads=[batch_size * num_heads * 1024, 1, 1], group_size=[1024, 1, 1])
+            self.lib.delta_rule_decode(*args, threads=[batch_size * num_heads * 512, 1, 1], group_size=[512, 1, 1])
         else:
             for start in range(0, seq_len, 32):
                 end = min(start + 32, seq_len)

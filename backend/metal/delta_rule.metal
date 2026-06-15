@@ -3,6 +3,7 @@
 using namespace metal;
 
 constant int D = 128;
+constant int DECODE_PARTS = 4;
 constant int C_PREFILL = 32;
 constant int D_PREFILL_TILE = 32;
 
@@ -80,25 +81,29 @@ static inline void run_delta_rule_token(device half* output, device float* state
         float qv = float(query[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
         float kv = float(key[qkv_offset(b, t, h, lane, seq_len, num_heads)]);
         q[lane] = qv; k[lane] = kv;
-        float q_partial = simd_sum(qv * qv), k_partial = simd_sum(kv * kv);
+        float q_partial = simd_sum(qv * qv), k_partial = simd_sum(kv * kv), qk_partial = simd_sum(qv * kv);
         if (simd_lane == 0) {
             scratch[simd_group] = q_partial;
             scratch[D / 32 + simd_group] = k_partial;
+            scratch[D / 16 + simd_group] = qk_partial;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group == 0) {
         float q_total = simd_sum(simd_lane < D / 32 ? scratch[simd_lane] : 0.0f);
         float k_total = simd_sum(simd_lane < D / 32 ? scratch[D / 32 + simd_lane] : 0.0f);
+        float qk_total = simd_sum(simd_lane < D / 32 ? scratch[D / 16 + simd_lane] : 0.0f);
         if (simd_lane == 0) {
             scratch[0] = q_total;
             scratch[1] = k_total;
+            scratch[1024] = qk_total;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group < D / 32) {
         float q_norm = rsqrt(scratch[0] + 1.0e-6f) * 0.08838834764831845f;
         float k_norm = rsqrt(scratch[1] + 1.0e-6f);
+        if (lane == 0) scratch[1024] *= q_norm * k_norm;
         q[lane] *= q_norm;
         k[lane] *= k_norm;
     }
@@ -107,58 +112,45 @@ static inline void run_delta_rule_token(device half* output, device float* state
     uint vv = lane & 127, part = lane >> 7;
     long base_offset = state_offset(b, h, 0, vv, num_heads);
     long row_stride  = state_offset(b, h, 1, vv, num_heads) - base_offset;
-    long loop_stride = 8 * row_stride; 
+    long loop_stride = DECODE_PARTS * row_stride;
     
     long off = base_offset + (part * row_stride);
-    float prediction = 0.0f;
+    float prediction = 0.0f, q_state = 0.0f;
     float decay = exp(g[(b * seq_len + t) * num_heads + h]);
     
-    for (uint kk = part; kk < D; kk += 8) {
+    for (uint kk = part; kk < D; kk += DECODE_PARTS) {
         float s = state[off] * decay;
         state[off] = s;             
         prediction += s * k[kk];
+        q_state += s * q[kk];
         off += loop_stride;
     }
     scratch[lane] = prediction;
+    scratch[512 + lane] = q_state;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // The first row of 128 threads reduce the 8 partials that summed give v[lane]
+    // The first row of 128 threads reduce the partials that summed give v[lane]
     if (part == 0) {
-        float pred = scratch[0 * 128 + vv] + scratch[1 * 128 + vv] + 
-                     scratch[2 * 128 + vv] + scratch[3 * 128 + vv] +
-                     scratch[4 * 128 + vv] + scratch[5 * 128 + vv] + 
-                     scratch[6 * 128 + vv] + scratch[7 * 128 + vv];
-                     
-        delta[vv] = (float(value[value_offset(b, t, h, vv, vs0, vs1, vs2, vs3)]) - pred) * float(beta[(b * seq_len + t) * num_heads + h]);
+        float pred = scratch[0 * 128 + vv] + scratch[1 * 128 + vv] +
+                     scratch[2 * 128 + vv] + scratch[3 * 128 + vv];
+        float cached_delta = (float(value[value_offset(b, t, h, vv, vs0, vs1, vs2, vs3)]) - pred) * float(beta[(b * seq_len + t) * num_heads + h]);
+        float q_total = scratch[512 + 0 * 128 + vv] + scratch[512 + 1 * 128 + vv] +
+                        scratch[512 + 2 * 128 + vv] + scratch[512 + 3 * 128 + vv];
+        delta[vv] = cached_delta;
+        output[qkv_offset(b, t, h, vv, seq_len, num_heads)] = half(q_total + cached_delta * scratch[1024]);
     }
     
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float out = 0.0f;
     float cached_delta = delta[vv]; // Cache into local register execution space
     off = base_offset + (part * row_stride); // Reset memory pointer to the top row
 
-    for (uint kk = part; kk < D; kk += 8) {
+    for (uint kk = part; kk < D; kk += DECODE_PARTS) {
         // Outer product
         float s = state[off]; 
         s += k[kk] * cached_delta;
         state[off] = s; 
-
-        // Output projection matmul
-        out += s * q[kk]; 
-        off += loop_stride; // (1024) for (8,128) blocks
+        off += loop_stride;
     }
-    scratch[lane] = out;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Same reduction as above
-    if (part == 0) {
-        float total = scratch[0 * 128 + vv] + scratch[1 * 128 + vv] + 
-                      scratch[2 * 128 + vv] + scratch[3 * 128 + vv] +
-                      scratch[4 * 128 + vv] + scratch[5 * 128 + vv] + 
-                      scratch[6 * 128 + vv] + scratch[7 * 128 + vv];
-                      
-        output[qkv_offset(b, t, h, vv, seq_len, num_heads)] = half(total);
-    }
-    
 }
 
 [[max_total_threads_per_threadgroup(128)]]
@@ -179,8 +171,8 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
     long C = min(long(C_PREFILL), seq_len - chunk);
     threadgroup half k_tile[C_PREFILL * D_PREFILL_TILE], w_tile[C_PREFILL * D_PREFILL_TILE], u_tile[C_PREFILL * D_PREFILL_TILE];
     threadgroup half k_full[C_PREFILL * D];
-    threadgroup half l_tile[C_PREFILL * C_PREFILL], qk_tile[C_PREFILL * C_PREFILL], m_tile[32 * 32], m_next[32 * 32];
-    threadgroup half p_w_tile[32 * 32], p_tmp[32 * 32];
+    threadgroup half l_tile[C_PREFILL * C_PREFILL], qk_tile[C_PREFILL * C_PREFILL], m_tile[32 * 32];
+    threadgroup half p_w_tile[32 * 32];
     threadgroup float gamma[C_PREFILL], inv_gamma[C_PREFILL], beta_tile[C_PREFILL], q_norm[C_PREFILL], k_norm[C_PREFILL], scratch[256];
 
     // Phase 1: gamma_i = prod_{m<=i} alpha_m and L2 norm factors (k & q)
@@ -242,14 +234,13 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
         m_tile[idx] = l_tile[idx]; p_w_tile[idx] = half(r == c ? 1.0f : 0.0f);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    invert32_unipotent(p_w_tile, p_tmp, m_tile, m_next, scratch, lane, simd_lane, simd_group);
+    invert32_unipotent(p_w_tile, l_tile, m_tile, k_tile, scratch, lane, simd_lane, simd_group);
 
     for (uint v0 = 0; v0 < D; v0 += D_PREFILL_TILE) {
         for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) u_tile[idx] = half(0.0f);
         if (has_initial_state) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint k0 = 0; k0 < D; k0 += D_PREFILL_TILE) { 
-                // diag(beta) K.
                 for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
                     uint i = idx / D_PREFILL_TILE, kd = idx % D_PREFILL_TILE;
                     k_tile[idx] = half(i < C ? beta_tile[i] * float(k_full[(k0 + kd) * C_PREFILL + i]) : 0.0f);
@@ -259,9 +250,9 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                     m_tile[idx] = half(state[state_offset(b, h, k0 + kd, v0 + vd, num_heads)]);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                // Phase 3: Apply W = P_W @ (diag(beta) * K)
+                // Phase 3: W = P_W @ (diag(beta) * K)
                 mma32x32(w_tile, p_w_tile, k_tile, scratch, simd_lane, simd_group, false, false, false);
-                // Phase 4: Historical payload term, accumulate W S_[t]^T.
+                // Phase 4: W S_[t]^T.
                 mma32x32(u_tile, w_tile, m_tile, scratch, simd_lane, simd_group, true, false, true);
             }
         }
@@ -280,32 +271,21 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // Phase 5: Sequence output, O = A_local DeltaV + diag(gamma) Q S_[t]^T.
-        for (uint block = simd_group; block < 4 * (D_PREFILL_TILE / 8); block += 4) {
-            uint ib = (block / (D_PREFILL_TILE / 8)) << 3, vb = (block % (D_PREFILL_TILE / 8)) << 3;
-            simdgroup_matrix<half, 8, 8> a, dv;
-            simdgroup_matrix<half, 8, 8> c = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
-            for (uint ko = 0; ko < C_PREFILL; ko += 8) {
-                simdgroup_load(a, qk_tile, C_PREFILL, ulong2(ko, ib));
-                simdgroup_load(dv, u_tile, D_PREFILL_TILE, ulong2(vb, ko));
-                simdgroup_multiply_accumulate(c, a, dv, c);
-            }
-            simdgroup_store(c, k_tile, D_PREFILL_TILE, ulong2(vb, ib));
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma32x32(k_tile, qk_tile, u_tile, scratch, simd_lane, simd_group, false, false, false);
         if (has_initial_state) {
             for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) w_tile[idx] = half(0.0f);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint k0 = 0; k0 < D; k0 += D_PREFILL_TILE) {
                 for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
                     uint i = idx / D_PREFILL_TILE, kd = idx % D_PREFILL_TILE, k = k0 + kd;
-                    p_tmp[idx] = half(i < C ? float(query[qkv_offset(b, chunk + i, h, k, seq_len, num_heads)]) * q_norm[i] : 0.0f);
+                    l_tile[idx] = half(i < C ? float(query[qkv_offset(b, chunk + i, h, k, seq_len, num_heads)]) * q_norm[i] : 0.0f);
                 }
                 for (uint idx = lane; idx < D_PREFILL_TILE * D_PREFILL_TILE; idx += 128) {
                     uint kd = idx / D_PREFILL_TILE, vd = idx % D_PREFILL_TILE;
                     m_tile[idx] = half(state[state_offset(b, h, k0 + kd, v0 + vd, num_heads)]);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                mma32x32(w_tile, p_tmp, m_tile, scratch, simd_lane, simd_group, true, false, true);
+                mma32x32(w_tile, l_tile, m_tile, scratch, simd_lane, simd_group, true, false, true);
             }
         }
         for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
@@ -351,7 +331,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
 }
 
 // One threadgroup per (B, n_heads)
-[[max_total_threads_per_threadgroup(1024)]]
+[[max_total_threads_per_threadgroup(512)]]
 kernel void delta_rule_decode(device half* output [[buffer(0)]],
                               device float* state [[buffer(1)]], device const half* query [[buffer(2)]],
                               device const half* key [[buffer(3)]], device const half* value [[buffer(4)]],
@@ -367,10 +347,10 @@ kernel void delta_rule_decode(device half* output [[buffer(0)]],
     long group = group3.x;
     if (group >= batch_size * num_heads) return;
     long b = group / num_heads, h = group - b * num_heads;
-    threadgroup float q[D], k[D], delta[D], scratch[1024];
+    threadgroup float q[D], k[D], delta[D], scratch[1025];
     // No divergence: all threads evaluate to same (no risk in barrier inside if)
     if (!has_initial_state) {
-        for (uint i = lane; i < D * D; i += 1024)
+        for (uint i = lane; i < D * D; i += 512)
             state[state_offset(b, h, i / D, i % D, num_heads)] = 0.0f;
         threadgroup_barrier(mem_flags::mem_device);
     }
