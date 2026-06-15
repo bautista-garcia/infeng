@@ -208,23 +208,27 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
     threadgroup half p_w_tile[32 * 32], p_tmp[32 * 32];
     threadgroup float gamma[C_PREFILL], inv_gamma[C_PREFILL], beta_tile[C_PREFILL], q_norm[C_PREFILL], k_norm[C_PREFILL], scratch[256];
 
-    // Phase 1: Local gating scan, gamma_i = prod_{m<=i} alpha_m.
-    if (lane < C_PREFILL) {
+    // Phase 1: gamma_i = prod_{m<=i} alpha_m and L2 norm factors (k & q)
+    if (lane < C_PREFILL) { // Only first SIMD works (4 SIMD available)
+        // alpha_t = exp(gt) or padding(1.0)
         float x = lane < C ? exp(g[(b * seq_len + chunk + lane) * num_heads + h]) : 1.0f;
+        // gamma_i: lane 0 = alpha_0 (tok 0); lane 1 = alpha_0 * alpha_1 (tok1) ...
         for (uint o = 1; o < 32; o <<= 1) { float y = simd_shuffle_up(x, o); if (simd_lane >= o) x *= y; }
         gamma[lane] = x;
         inv_gamma[lane] = 1.0f / x;
         beta_tile[lane] = lane < C ? float(beta[(b * seq_len + chunk + lane) * num_heads + h]) : 0.0f;
     }
 
-    {
+    { // This defines a local scope for variables like t and p
         uint t = lane >> 2, p = lane & 3;
         float qs = 0.0f, ks = 0.0f;
+        // C reductions (t) with 4 partials each (p)
         for (uint d = p; d < D; d += 4) {
             float qv = t < C ? float(query[qkv_offset(b, chunk + t, h, d, seq_len, num_heads)]) : 0.0f;
             float kv = t < C ? float(key[qkv_offset(b, chunk + t, h, d, seq_len, num_heads)]) : 0.0f;
             qs += qv * qv; ks += kv * kv;
         }
+        // Reduce + broadcast partials (shuffle_xor reads from thread m lanes apart)
         qs += simd_shuffle_xor(qs, 1); qs += simd_shuffle_xor(qs, 2);
         ks += simd_shuffle_xor(ks, 1); ks += simd_shuffle_xor(ks, 2);
         if ((simd_lane & 3) == 0) {
@@ -235,35 +239,38 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 2: Base GEMMs, M_W = strictLower(-diag(beta) K K^T), A_local = causalLower(Gamma o (Q K^T)).
-    for (uint d0 = 0; d0 < D; d0 += D_PREFILL_TILE) {
+    for (uint d0 = 0; d0 < D; d0 += D_PREFILL_TILE) { // Tiles of (C_PREFILL, D_PREFILL)
+        // Load (C_PREFILL, D_PREFILL) tile cooperatively and L2 norm
         for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
             uint i = idx / D_PREFILL_TILE, d = d0 + idx % D_PREFILL_TILE;
             k_tile[idx] = half(i < C ? float(key[qkv_offset(b, chunk + i, h, d, seq_len, num_heads)]) * k_norm[i] : 0.0f);
             u_tile[idx] = half(i < C ? float(query[qkv_offset(b, chunk + i, h, d, seq_len, num_heads)]) * q_norm[i] : 0.0f);
             k_full[d * C_PREFILL + i] = k_tile[idx];
+            // K^T
             w_tile[(idx % D_PREFILL_TILE) * C_PREFILL + i] = k_tile[idx];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // (32,32) tile -> 16 (8,8) tiles:
+        // 4 outer products that compute (K @ K^T; Q @ K^T)
         for (uint block = simd_group; block < 16; block += 4) {
             uint ib = (block >> 2) << 3, jb = (block & 3) << 3;
-            simdgroup_matrix<half, 8, 8> a, b;
-            simdgroup_matrix<half, 8, 8> c;
-            if (d0 == 0) c = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
-            else simdgroup_load(c, l_tile, C_PREFILL, ulong2(jb, ib));
+            simdgroup_matrix<half, 8, 8> a, b, kk_acc, qk_acc;
+            if (d0 == 0) {
+                kk_acc = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
+                qk_acc = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
+            } else {
+                simdgroup_load(kk_acc, l_tile, C_PREFILL, ulong2(jb, ib));
+                simdgroup_load(qk_acc, qk_tile, C_PREFILL, ulong2(jb, ib));
+            }
             for (uint ko = 0; ko < D_PREFILL_TILE; ko += 8) {
+                simdgroup_load(b, w_tile, C_PREFILL, ulong2(jb, ko));
                 simdgroup_load(a, k_tile, D_PREFILL_TILE, ulong2(ko, ib));
-                simdgroup_load(b, w_tile, C_PREFILL, ulong2(jb, ko));
-                simdgroup_multiply_accumulate(c, a, b, c);
-            }
-            simdgroup_store(c, l_tile, C_PREFILL, ulong2(jb, ib));
-            if (d0 == 0) c = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
-            else simdgroup_load(c, qk_tile, C_PREFILL, ulong2(jb, ib));
-            for (uint ko = 0; ko < D_PREFILL_TILE; ko += 8) {
-                simdgroup_load(b, w_tile, C_PREFILL, ulong2(jb, ko));
+                simdgroup_multiply_accumulate(kk_acc, a, b, kk_acc);
                 simdgroup_load(a, u_tile, D_PREFILL_TILE, ulong2(ko, ib));
-                simdgroup_multiply_accumulate(c, a, b, c);
+                simdgroup_multiply_accumulate(qk_acc, a, b, qk_acc);
             }
-            simdgroup_store(c, qk_tile, C_PREFILL, ulong2(jb, ib));
+            simdgroup_store(kk_acc, l_tile, C_PREFILL, ulong2(jb, ib));
+            simdgroup_store(qk_acc, qk_tile, C_PREFILL, ulong2(jb, ib));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
