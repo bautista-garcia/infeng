@@ -238,7 +238,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 2: Base GEMMs, M_W = strictLower(-diag(beta) K K^T), A_local = causalLower(Gamma o (Q K^T)).
+    // Phase 2: GEMM (K @ K^T, Q @ K^T)
     for (uint d0 = 0; d0 < D; d0 += D_PREFILL_TILE) { // Tiles of (C_PREFILL, D_PREFILL)
         // Load (C_PREFILL, D_PREFILL) tile cooperatively and L2 norm
         for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
@@ -274,13 +274,14 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // Lw = strictLower(-diag(beta) K K^T), A_local = causalLower(Gamma o (Q K^T)).
     for (uint idx = lane; idx < C_PREFILL * C_PREFILL; idx += 128) {
         uint i = idx >> 5, j = idx & 31;
         l_tile[idx] = half(j < i && i < C && j < C ? -beta_tile[i] * float(l_tile[idx]) : 0.0f);
         qk_tile[idx] = half(j <= i && i < C && j < C ? gamma[i] * inv_gamma[j] * float(qk_tile[idx]) : 0.0f);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Phase 3: Unipotent system, P_W = (I - M_W)^-1; U uses D_gamma P_W D_gamma^-1 by RHS/output scaling.
+    // Phase 3: Solve (I + Lw)^-1 via unipotent neumann series (reuse for (I + Lu)^-1)
     for (uint idx = lane; idx < 32 * 32; idx += 128) {
         uint r = idx >> 5, c = idx & 31;
         m_tile[idx] = l_tile[idx]; p_w_tile[idx] = half(r == c ? 1.0f : 0.0f);
@@ -292,8 +293,8 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
         for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) u_tile[idx] = half(0.0f);
         if (has_initial_state) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint k0 = 0; k0 < D; k0 += D_PREFILL_TILE) {
-                // Phase 3: Apply W = P_W diag(beta) K.
+            for (uint k0 = 0; k0 < D; k0 += D_PREFILL_TILE) { 
+                // diag(beta) K.
                 for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
                     uint i = idx / D_PREFILL_TILE, kd = idx % D_PREFILL_TILE;
                     k_tile[idx] = half(i < C ? beta_tile[i] * float(k_full[(k0 + kd) * C_PREFILL + i]) : 0.0f);
@@ -303,6 +304,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                     m_tile[idx] = half(state[state_offset(b, h, k0 + kd, v0 + vd, num_heads)]);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Phase 3: Apply W = P_W @ (diag(beta) * K)
                 mma32x16(w_tile, k_tile, p_w_tile, scratch, 0, 0, simd_lane, simd_group, false);
                 // Phase 4: Historical payload term, accumulate W S_[t]^T.
                 mma32x16x16(u_tile, w_tile, m_tile, scratch, simd_lane, simd_group, true);
