@@ -18,62 +18,37 @@ static inline long value_offset(long b, long t, long h, long d, long s0, long s1
     return b * s0 + t * s1 + h * s2 + d * s3;
 }
 
-static inline void mma32x16(threadgroup half* dst, threadgroup half* src, threadgroup half* m, threadgroup float* scratch,
-                            uint dst_row, uint src_row, uint simd_lane, uint simd_group, bool add) {
-    const uint nb = D_PREFILL_TILE / 8;
-    for (uint block = simd_group; block < 4 * nb; block += 4) {
-        uint rb = (block / nb) << 3, cb = (block % nb) << 3;
-        simdgroup_matrix<half, 8, 8> a, b;
-        simdgroup_matrix<half, 8, 8> c;
-        if (add) simdgroup_load(c, dst, D_PREFILL_TILE, ulong2(cb, dst_row + rb));
-        else c = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
-        for (uint ko = 0; ko < 32; ko += 8) {
-            simdgroup_load(a, m, 32, ulong2(ko, rb));
-            simdgroup_load(b, src, D_PREFILL_TILE, ulong2(cb, src_row + ko));
-            simdgroup_multiply_accumulate(c, a, b, c);
-        }
-        simdgroup_store(c, dst, D_PREFILL_TILE, ulong2(cb, dst_row + rb));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-
 static inline void mma32x32(threadgroup half* dst, threadgroup half* a_src, threadgroup half* b_src, threadgroup float* scratch,
-                            uint simd_lane, uint simd_group, bool add) {
-    for (uint block = simd_group; block < 10; block += 4) {
-        uint br = block < 1 ? 0 : (block < 3 ? 1 : (block < 6 ? 2 : 3));
-        uint rb = br << 3, cb = (block - (br * (br + 1) >> 1)) << 3;
+                            uint simd_lane, uint simd_group, bool add, bool lower_only, bool fp32_accum) {
+    for (uint block = simd_group; block < (lower_only ? 10 : 16); block += 4) {
+        uint br = lower_only ? (block < 1 ? 0 : (block < 3 ? 1 : (block < 6 ? 2 : 3))) : block >> 2;
+        uint rb = br << 3, cb = (lower_only ? block - (br * (br + 1) >> 1) : block & 3) << 3, base = simd_group << 6;
         simdgroup_matrix<half, 8, 8> a, b;
-        simdgroup_matrix<half, 8, 8> c;
-        if (add) simdgroup_load(c, dst, 32, ulong2(cb, rb));
-        else c = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
-        for (uint ko = 0; ko < 32; ko += 8) {
-            simdgroup_load(a, a_src, 32, ulong2(ko, rb));
-            simdgroup_load(b, b_src, 32, ulong2(cb, ko));
-            simdgroup_multiply_accumulate(c, a, b, c);
+        if (fp32_accum) {
+            simdgroup_matrix<float, 8, 8> c = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint ko = 0; ko < 32; ko += 8) {
+                simdgroup_load(a, a_src, 32, ulong2(ko, rb));
+                simdgroup_load(b, b_src, 32, ulong2(cb, ko));
+                simdgroup_multiply_accumulate(c, a, b, c);
+            }
+            simdgroup_store(c, scratch + base, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = simd_lane; e < 64; e += 32) {
+                uint r = e >> 3, col = e & 7, di = (rb + r) * 32 + cb + col;
+                dst[di] = half((add ? float(dst[di]) : 0.0f) + scratch[base + e]);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            simdgroup_matrix<half, 8, 8> c;
+            if (add) simdgroup_load(c, dst, 32, ulong2(cb, rb));
+            else c = make_filled_simdgroup_matrix<half, 8, 8>(half(0.0f));
+            for (uint ko = 0; ko < 32; ko += 8) {
+                simdgroup_load(a, a_src, 32, ulong2(ko, rb));
+                simdgroup_load(b, b_src, 32, ulong2(cb, ko));
+                simdgroup_multiply_accumulate(c, a, b, c);
+            }
+            simdgroup_store(c, dst, 32, ulong2(cb, rb));
         }
-        simdgroup_store(c, dst, 32, ulong2(cb, rb));
-    }
-}
-
-static inline void mma32x16x16(threadgroup half* dst, threadgroup half* lhs, threadgroup half* rhs,
-                               threadgroup float* scratch, uint simd_lane, uint simd_group, bool add) {
-    const uint nb = D_PREFILL_TILE / 8;
-    for (uint block = simd_group; block < 4 * nb; block += 4) {
-        uint rb = (block / nb) << 3, cb = (block % nb) << 3, base = simd_group << 6;
-        simdgroup_matrix<half, 8, 8> a, b;
-        simdgroup_matrix<float, 8, 8> c = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        for (uint ko = 0; ko < D_PREFILL_TILE; ko += 8) {
-            simdgroup_load(a, lhs, D_PREFILL_TILE, ulong2(ko, rb));
-            simdgroup_load(b, rhs, D_PREFILL_TILE, ulong2(cb, ko));
-            simdgroup_multiply_accumulate(c, a, b, c);
-        }
-        simdgroup_store(c, scratch + base, 8);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint e = simd_lane; e < 64; e += 32) {
-            uint r = e >> 3, col = e & 7, di = (rb + r) * D_PREFILL_TILE + cb + col;
-            dst[di] = half((add ? float(dst[di]) : 0.0f) + scratch[base + e]);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
@@ -84,8 +59,8 @@ static inline void invert32_unipotent(threadgroup half* p, threadgroup half* p_n
     for (uint stage = 0; stage < 5; ++stage) {
         for (uint idx = lane; idx < 32 * 32; idx += 128) p_next[idx] = p[idx];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma32x32(p_next, m, p, scratch, simd_lane, simd_group, true);
-        mma32x32(m_next, m, m, scratch, simd_lane, simd_group, false);
+        mma32x32(p_next, m, p, scratch, simd_lane, simd_group, true, true, false);
+        mma32x32(m_next, m, m, scratch, simd_lane, simd_group, false, true, false);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint idx = lane; idx < 32 * 32; idx += 128) {
             uint r = idx >> 5, c = idx & 31;
@@ -250,8 +225,8 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
             w_tile[(idx % D_PREFILL_TILE) * C_PREFILL + i] = k_tile[idx];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma32x32(l_tile, k_tile, w_tile, scratch, simd_lane, simd_group, d0 != 0);
-        mma32x32(qk_tile, u_tile, w_tile, scratch, simd_lane, simd_group, d0 != 0);
+        mma32x32(l_tile, k_tile, w_tile, scratch, simd_lane, simd_group, d0 != 0, true, false);
+        mma32x32(qk_tile, u_tile, w_tile, scratch, simd_lane, simd_group, d0 != 0, true, false);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     // Lw = strictLower(-diag(beta) K K^T), A_local = causalLower(Gamma o (Q K^T)).
@@ -285,9 +260,9 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 // Phase 3: Apply W = P_W @ (diag(beta) * K)
-                mma32x16(w_tile, k_tile, p_w_tile, scratch, 0, 0, simd_lane, simd_group, false);
+                mma32x32(w_tile, p_w_tile, k_tile, scratch, simd_lane, simd_group, false, false, false);
                 // Phase 4: Historical payload term, accumulate W S_[t]^T.
-                mma32x16x16(u_tile, w_tile, m_tile, scratch, simd_lane, simd_group, true);
+                mma32x32(u_tile, w_tile, m_tile, scratch, simd_lane, simd_group, true, false, true);
             }
         }
         // Phase 3: Apply Utilde = P_U diag(beta) V, M_U = Gamma o M_W.
@@ -296,7 +271,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
             k_tile[idx] = half(i < C ? beta_tile[i] * inv_gamma[i] * float(value[value_offset(b, chunk + i, h, v, vs0, vs1, vs2, vs3)]) : 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma32x16(w_tile, k_tile, p_w_tile, scratch, 0, 0, simd_lane, simd_group, false);
+        mma32x32(w_tile, p_w_tile, k_tile, scratch, simd_lane, simd_group, false, false, false);
 
         // Phase 4: Data payload resolution, DeltaV = Utilde - W S_[t]^T.
         for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
@@ -330,7 +305,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                     m_tile[idx] = half(state[state_offset(b, h, k0 + kd, v0 + vd, num_heads)]);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                mma32x16x16(w_tile, p_tmp, m_tile, scratch, simd_lane, simd_group, true);
+                mma32x32(w_tile, p_tmp, m_tile, scratch, simd_lane, simd_group, true, false, true);
             }
         }
         for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
