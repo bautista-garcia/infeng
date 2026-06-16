@@ -204,7 +204,6 @@ class FullAttention(nn.Module):
         self.num_key_value_heads = _get(config, "num_key_value_heads")
         self.head_dim = _get(config, "head_dim", self.hidden_size // self.num_heads)
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
         attention_bias = _get(config, "attention_bias", False)
         eps = _get(config, "rms_norm_eps", 1e-6)
 
@@ -249,29 +248,25 @@ class FullAttention(nn.Module):
         key_states = _repeat_kv(key_states, self.num_key_value_groups)
         value_states = _repeat_kv(value_states, self.num_key_value_groups)
 
-        # Q @ K^T/sqrt(d)
-        scores = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-
-        # Applies passed mask, or usual lower-triangular causal mask
+        q_len, k_len = query_states.shape[-2], key_states.shape[-2]
+        attn_mask, is_causal = None, False
         if attention_mask is not None:
             if attention_mask.ndim == 2:
-                scores = scores.masked_fill(attention_mask[:, None, None, :].to(torch.bool).logical_not(), -torch.inf)
+                attn_mask = attention_mask[:, None, None, :].to(torch.bool)
             else:
-                scores = scores + attention_mask
+                attn_mask = attention_mask
         elif key_mask is not None:
             pos_ids = position_ids[1:] if position_ids.ndim == 3 and position_ids.shape[0] == 4 else position_ids
             pos_ids = pos_ids[0] if pos_ids.ndim == 3 else pos_ids
-            static_mask = torch.arange(key_states.shape[-2], device=key_states.device)[None, None, None, :] <= pos_ids[:, None, :, None]
-            scores = scores.masked_fill(~static_mask | ~key_mask[None, None, None, :], -torch.inf)
+            attn_mask = (torch.arange(k_len, device=key_states.device)[None, None, None, :] <= pos_ids[:, None, :, None]
+                         ) & key_mask[None, None, None, :]
+        elif q_len == k_len:
+            is_causal = True
         else:
-            q_len, k_len = query_states.shape[-2], key_states.shape[-2]
-            causal_mask = torch.ones(q_len, k_len, dtype=torch.bool, device=query_states.device)
-            causal_mask = causal_mask.tril(diagonal=k_len - q_len)
-            scores = scores.masked_fill(~causal_mask, -torch.inf)
+            attn_mask = torch.ones(q_len, k_len, dtype=torch.bool, device=query_states.device).tril(diagonal=k_len - q_len)
 
-        # Softmax(QK^T/sqrt(d)) @ V
-        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(probs, value_states)
+        attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=attn_mask,
+                                                     dropout_p=0.0, is_causal=is_causal)
         # Back to (B, L, D)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         # Gating/modulation with the gate vector
