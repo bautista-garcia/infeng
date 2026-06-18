@@ -77,8 +77,8 @@ def main():
     ttft_s, decode_s = sum(ttft) / len(ttft), sum(decode) / len(decode)
     tpot_s, ttl_s = decode_s / a.decode, ttft_s + decode_s
     print(f"TTFT={ttft_s * 1000:.2f}ms TPOT={tpot_s * 1000:.2f}ms TTL={ttl_s:.2f}s "
-          f"tok/s={a.batch * (a.prefill + a.decode) / ttl_s:.2f} decode_tok/s={a.batch / tpot_s:.2f} "
-          f"peak_mem={peak / 2**30:.2f}GiB MBU={(model_bytes * a.batch / tpot_s) / BANDWIDTH_BPS * 100:.2f}% "
+          f"tok/s={a.batch * (a.prefill + a.decode) / ttl_s:.2f} prefill_tok/s={a.batch * a.prefill / ttft_s:.2f} "
+          f"decode_tok/s={a.batch / tpot_s:.2f} peak_mem={peak / 2**30:.2f}GiB MBU={(model_bytes * a.batch / tpot_s) / BANDWIDTH_BPS * 100:.2f}% "
           f"MFU={(2 * params * a.batch * a.prefill / ttft_s) / FLOPS * 100:.2f}%", flush=True)
 
 
