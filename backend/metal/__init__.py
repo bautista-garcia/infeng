@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
 
 _DELTA_RULE_KERNELS: "DeltaRuleKernels | None" = None
-_LINEAR_KERNELS: "LinearKernels | None" = None
+_QUANT_LINEAR_KERNELS: "QuantLinearKernels | None" = None
 
 
 @dataclass
@@ -64,37 +65,53 @@ def get_delta_rule_kernels() -> DeltaRuleKernels:
 
 
 @dataclass
-class LinearKernels:
+class QuantLinearKernels:
     lib: object
 
-    def __call__(self, x: torch.Tensor, weight: torch.Tensor, prefill: bool | None = None) -> torch.Tensor:
-        if x.device.type != "mps" or weight.device.type != "mps" or x.dtype != torch.float16 or weight.dtype != torch.float16:
-            raise RuntimeError("Metal linear requires fp16 x/weight on mps")
-        if x.ndim < 2 or weight.ndim != 2 or x.shape[-1] != weight.shape[1]:
-            raise RuntimeError(f"Metal linear expects x=(..., K), weight=(N, K); got {x.shape}, {weight.shape}")
-        if not x.is_contiguous() or not weight.is_contiguous():
-            raise RuntimeError("Metal linear expects contiguous x and weight")
-        shape, m, k, n = (*x.shape[:-1], weight.shape[0]), x.numel() // x.shape[-1], x.shape[-1], weight.shape[0]
-        y = torch.empty(shape, dtype=x.dtype, device=x.device)
-        use_prefill = m > 1 if prefill is None else prefill
-        if use_prefill:
-            self.lib.linear_prefill(y, x, weight, m, k, n, threads=[(n + 31) // 32 * 512, (m + 31) // 32, 1],
-                                    group_size=[512, 1, 1])
+    def __call__(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
+        m, k, n = x.numel() // x.shape[-1], x.shape[-1], weight.shape[0]
+        if k != weight.shape[1]:
+            raise RuntimeError(f"quant linear expects x=(...,K), weight=(N,K); got {x.shape}, {weight.shape}")
+        y = torch.empty((*x.shape[:-1], n), dtype=x.dtype, device=x.device)
+        registry = {
+            ("Q4_K", 4096, 1024): (self.lib.q4_k_k4096_n1024_decode, self.lib.q4_k_k4096_n1024_prefill, "mma"),
+            ("Q4_K", 4096, 4096): (self.lib.q4_k_k4096_n4096_decode, self.lib.q4_k_k4096_n4096_prefill, "mma"),
+            ("Q4_K", 12288, 4096): (self.lib.q4_k_k12288_n4096_decode, self.lib.q4_k_k12288_n4096_prefill, "mma"),
+            ("Q4_K", 4096, 8192): (self.lib.q4_k_k4096_n8192_decode, self.lib.q4_k_k4096_n8192_prefill, "mma"),
+            ("Q4_K", 4096, 12288): (self.lib.q4_k_k4096_n12288_decode, self.lib.q4_k_k4096_n12288_prefill, "mma"),
+            ("Q5_K", 4096, 1024): (self.lib.q5_k_k4096_n1024_decode, self.lib.q5_k_k4096_n1024_prefill, "mma"),
+            ("Q5_K", 4096, 4096): (self.lib.q5_k_k4096_n4096_decode, self.lib.q5_k_k4096_n4096_prefill, "mma"),
+            ("Q5_K", 12288, 4096): (self.lib.q5_k_k12288_n4096_decode, self.lib.q5_k_k12288_n4096_prefill, "mma"),
+            ("Q5_K", 4096, 8192): (self.lib.q5_k_k4096_n8192_decode, self.lib.q5_k_k4096_n8192_prefill, "mma"),
+            ("Q5_K", 4096, 12288): (self.lib.q5_k_k4096_n12288_decode, self.lib.q5_k_k4096_n12288_prefill, "mma"),
+            ("Q6_K", 4096, 1024): (self.lib.q6_k_k4096_n1024_decode, self.lib.q6_k_k4096_n1024_prefill, "mma"),
+            ("Q6_K", 12288, 4096): (self.lib.q6_k_k12288_n4096_decode, self.lib.q6_k_k12288_n4096_prefill, "mma"),
+            ("Q6_K", 4096, 248320): (self.lib.q6_k_k4096_n248320_decode, self.lib.q6_k_k4096_n248320_prefill, "mma"),
+            ("Q8_0", 4096, 4096): (self.lib.q8_0_k4096_n4096_decode, self.lib.q8_0_k4096_n4096_prefill, "mma"),
+            ("IQ4_XS", 4096, 12288): (self.lib.iq4_xs_k4096_n12288_decode,
+                                       self.lib.iq4_xs_k4096_n12288_prefill, "scalar"),
+        }
+        if (weight.type_name, k, n) not in registry:
+            raise RuntimeError(f"unsupported quant linear specialization {(weight.type_name, k, n)}")
+        decode, prefill, kind = registry[(weight.type_name, k, n)]
+        if m == 1:
+            decode(y, x, weight.data, threads=[32, (n + 3) // 4, 1], group_size=[32, 1, 1])
         else:
-            if k >= 4096 and k % 1024 == 0 and n % 4 == 0:
-                self.lib.linear_decode_aligned(y, x, weight, m, k, n, threads=[(n + 3) // 4 * 256, m, 1],
-                                               group_size=[256, 1, 1])
-            elif k % 512 == 0 and n % 4 == 0:
-                self.lib.linear_decode_aligned128(y, x, weight, m, k, n, threads=[(n + 3) // 4 * 128, m, 1],
-                                                  group_size=[128, 1, 1])
-            else:
-                self.lib.linear_decode(y, x, weight, m, k, n, threads=[(n + 3) // 4 * 256, m, 1], group_size=[256, 1, 1])
+            threads = [128, n // 32, (m + 31) // 32] if kind == "mma" else [32, (n + 3) // 4, m]
+            prefill(y, x, weight.data, m, threads=threads, group_size=[threads[0], 1, 1])
+        return y
+
+    def embed_q4(self, ids: torch.Tensor, weight: Any, dtype: torch.dtype) -> torch.Tensor:
+        y = torch.empty((*ids.shape, weight.shape[1]), dtype=dtype, device=ids.device)
+        tokens, k = ids.numel(), weight.shape[1]
+        self.lib.q4_k_embed(y, ids, weight.data, tokens, k,
+                            threads=[((k + 255) // 256) * 256, tokens, 1], group_size=[256, 1, 1])
         return y
 
 
-def get_linear_kernels() -> LinearKernels:
-    global _LINEAR_KERNELS
-    if _LINEAR_KERNELS is None:
-        source = (Path(__file__).with_name("linear.metal")).read_text()
-        _LINEAR_KERNELS = LinearKernels(torch.mps.compile_shader(source))
-    return _LINEAR_KERNELS
+def get_quant_linear_kernels() -> QuantLinearKernels:
+    global _QUANT_LINEAR_KERNELS
+    if _QUANT_LINEAR_KERNELS is None:
+        source = (Path(__file__).with_name("quant_linear.metal")).read_text()
+        _QUANT_LINEAR_KERNELS = QuantLinearKernels(torch.mps.compile_shader(source))
+    return _QUANT_LINEAR_KERNELS

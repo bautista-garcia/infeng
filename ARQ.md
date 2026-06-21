@@ -63,4 +63,14 @@ TTFT=1073.64ms TPOT=59.77ms TTL=8.72s tok/s=73.36 prefill_tok/s=476.88 decode_to
 
 This is about 76 tok/s behind llama.cpp on prefill and about 2 tok/s behind on decode for Qwen3.5 4B BF16. That is a strong current result: the custom path is close while still preserving a clear PyTorch reference path and an optimization log for the Metal kernels.
 
+## 2026-06-18 - Qwen3.5 9B UD-Q4 GGUF Runtime Refactor
 
+The 9B UD-Q4 model is now treated as the source of truth for both architecture and weights. `model/qwen35/weights.py` parses GGUF metadata and tensor descriptors directly, derives the Qwen3.5 text config from `qwen35.*` metadata, and maps tensor payloads into `QuantWeight` objects instead of copying GGUF tensors into `nn.Parameter` state.
+
+`QuantWeight` keeps the mmap-backed `torch.frombuffer` data pointer, GGUF type, shape, byte offset, byte size, and block layout. Native `F32`/`F16` tensors and quantized tensors share this interface, which lets layers remain simple: projections, embeddings, norms, convolution weights, SSM scalars, and the output head are plain attributes attached by the loader.
+
+The model graph no longer depends on `state_dict()` or `model.parameters()` for inference ownership. `Linear.forward()` routes through `backend.metal.quant_linear`, embeddings route through `quant_embedding`, and runtime surfaces use explicit `model.device`/`model.dtype`. The separate `output.weight` tensor in the 9B GGUF is used as `lm_head`; tied embeddings are not assumed.
+
+The decode backend now uses fused Metal dequant+matvec kernels for `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, and observed `IQ4_XS`. Quant bytes are copied to MPS once per weight on first use, while the mmap-backed CPU view remains the owner loaded from GGUF. Prefill and embedding row gather still use the CPU reference dequant path where needed; decode no longer materializes full dense matrices per token.
+
+Correctness now uses llama.cpp as the oracle. The lightweight tests cover GGUF config derivation and loader attachment; the full greedy generation parity test is gated behind `RUN_QWEN35_9B_LLAMA=1` and runs our engine before `llama-cli` so both models are not resident at the same time.

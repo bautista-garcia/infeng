@@ -172,16 +172,15 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
     threadgroup half k_full[C_PREFILL * D];
     threadgroup half l_tile[C_PREFILL * C_PREFILL], qk_tile[C_PREFILL * C_PREFILL], m_tile[32 * 32];
     threadgroup half p_w_tile[32 * 32];
-    threadgroup float gamma[C_PREFILL], inv_gamma[C_PREFILL], beta_tile[C_PREFILL], q_norm[C_PREFILL], k_norm[C_PREFILL], scratch[256];
+    threadgroup float gamma[C_PREFILL], log_gamma[C_PREFILL], beta_tile[C_PREFILL], q_norm[C_PREFILL], k_norm[C_PREFILL], scratch[256];
 
     // Phase 1: gamma_i = prod_{m<=i} alpha_m and L2 norm factors (k & q)
     if (lane < C_PREFILL) { // Only first SIMD works (4 SIMD available)
-        // alpha_t = exp(gt) or padding(1.0)
-        float x = lane < C ? exp(g[(b * seq_len + chunk + lane) * num_heads + h]) : 1.0f;
-        // gamma_i: lane 0 = alpha_0 (tok 0); lane 1 = alpha_0 * alpha_1 (tok1) ...
-        for (uint o = 1; o < 32; o <<= 1) { float y = simd_shuffle_up(x, o); if (simd_lane >= o) x *= y; }
-        gamma[lane] = x;
-        inv_gamma[lane] = 1.0f / x;
+        // log(gamma_i) = sum_{m<=i} g_m; keep ratios in log-space to avoid fp32 under/overflow.
+        float x = lane < C ? g[(b * seq_len + chunk + lane) * num_heads + h] : 0.0f;
+        for (uint o = 1; o < 32; o <<= 1) { float y = simd_shuffle_up(x, o); if (simd_lane >= o) x += y; }
+        gamma[lane] = exp(x);
+        log_gamma[lane] = x;
         beta_tile[lane] = lane < C ? float(beta[(b * seq_len + chunk + lane) * num_heads + h]) : 0.0f;
     }
 
@@ -224,7 +223,7 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
     for (uint idx = lane; idx < C_PREFILL * C_PREFILL; idx += 128) {
         uint i = idx >> 5, j = idx & 31;
         l_tile[idx] = half(j < i && i < C && j < C ? -beta_tile[i] * float(l_tile[idx]) : 0.0f);
-        qk_tile[idx] = half(j <= i && i < C && j < C ? gamma[i] * inv_gamma[j] * float(qk_tile[idx]) : 0.0f);
+        qk_tile[idx] = half(j <= i && i < C && j < C ? exp(log_gamma[i] - log_gamma[j]) * float(qk_tile[idx]) : 0.0f);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Phase 3: Solve (I + Lw)^-1 via unipotent neumann series (reuse for (I + Lu)^-1)
@@ -255,18 +254,23 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
                 mma32x32(u_tile, w_tile, m_tile, scratch, simd_lane, simd_group, true, false, true);
             }
         }
-        // Phase 3: Apply Utilde = P_U diag(beta) V, M_U = Gamma o M_W.
-        for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
-            uint i = idx / D_PREFILL_TILE, vd = idx % D_PREFILL_TILE, v = v0 + vd;
-            k_tile[idx] = half(i < C ? beta_tile[i] * inv_gamma[i] * float(value[value_offset(b, chunk + i, h, v, vs0, vs1, vs2, vs3)]) : 0.0f);
+        // Phase 3: Apply Utilde = diag(gamma) P_U diag(inv_gamma) diag(beta) V, M_U = Gamma o M_W.
+        for (uint idx = lane; idx < C_PREFILL * C_PREFILL; idx += 128) {
+            uint i = idx >> 5, j = idx & 31;
+            l_tile[idx] = half(i < C && j <= i ? exp(log_gamma[i] - log_gamma[j]) * float(p_w_tile[idx]) : 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma32x32(w_tile, p_w_tile, k_tile, scratch, simd_lane, simd_group, false, false, false);
+        for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
+            uint i = idx / D_PREFILL_TILE, vd = idx % D_PREFILL_TILE, v = v0 + vd;
+            k_tile[idx] = half(i < C ? beta_tile[i] * float(value[value_offset(b, chunk + i, h, v, vs0, vs1, vs2, vs3)]) : 0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma32x32(w_tile, l_tile, k_tile, scratch, simd_lane, simd_group, false, false, false);
 
         // Phase 4: Data payload resolution, DeltaV = Utilde - W S_[t]^T.
         for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
             uint i = idx / D_PREFILL_TILE;
-            u_tile[idx] = half(gamma[i] * (float(w_tile[idx]) - float(u_tile[idx])));
+            u_tile[idx] = half(i < C ? float(w_tile[idx]) - gamma[i] * float(u_tile[idx]) : 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // Phase 5: Sequence output, O = A_local DeltaV + diag(gamma) Q S_[t]^T.
@@ -292,10 +296,10 @@ kernel void delta_rule_prefill(device half* output [[buffer(0)]],
             if (i < C) output[qkv_offset(b, chunk + i, h, v, seq_len, num_heads)] = half(float(k_tile[idx]) + (has_initial_state ? gamma[i] * float(w_tile[idx]) : 0.0f));
         }
         // Phase 6: State transition, S_[t+1] = gamma_C S_[t] + DeltaV_state^T K.
-        float gamma_c = gamma[C - 1];
+        float gamma_c = gamma[C - 1], log_gamma_c = log_gamma[C - 1];
         for (uint idx = lane; idx < C_PREFILL * D_PREFILL_TILE; idx += 128) {
             uint i = idx / D_PREFILL_TILE;
-            u_tile[idx] = half(i < C ? gamma_c * inv_gamma[i] * float(u_tile[idx]) : 0.0f);
+            u_tile[idx] = half(i < C ? exp(log_gamma_c - log_gamma[i]) * float(u_tile[idx]) : 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (has_initial_state) {

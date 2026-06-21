@@ -5,6 +5,7 @@ import gc
 import os
 import sys
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -14,13 +15,18 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
-from backend.metal import get_delta_rule_kernels
+from backend.metal import get_delta_rule_kernels, get_quant_linear_kernels
+from model.qwen35.weights import GGUF_BLOCK
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Qwen3.5 MPS kernel profiler")
     p.add_argument("--target", default="delta")
     p.add_argument("--seq-len", "--seq_len", dest="seq_len", type=int, default=1)
+    p.add_argument("--quant-type", "--quant_type", dest="quant_type", default="Q4_K",
+                   choices=("Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ4_XS"))
+    p.add_argument("--in-features", "--in_features", dest="in_features", type=int, default=4096)
+    p.add_argument("--out-features", "--out_features", dest="out_features", type=int, default=4096)
     return p.parse_args()
 
 
@@ -62,6 +68,13 @@ def capture(name: str):
     return stack, gputrace
 
 
+@dataclass
+class QuantWeight:
+    shape: tuple[int, int]
+    type_name: str
+    data: torch.Tensor
+
+
 def profile_delta(a):
     device, dtype, batch, heads, dim = torch.device("mps"), torch.float16, 1, 32, 128
     q = torch.randn(batch, a.seq_len, heads, dim, device=device, dtype=dtype).contiguous()
@@ -86,10 +99,45 @@ def profile_delta(a):
             "gputrace": gputrace if gputrace and gputrace.exists() else None}
 
 
+def profile_quant_linear(a):
+    device, dtype, m, k, n = torch.device("mps"), torch.float16, a.seq_len, a.in_features, a.out_features
+    block_size, block_bytes = GGUF_BLOCK[a.quant_type]
+    if k % block_size:
+        raise ValueError(f"{a.quant_type} requires --in-features divisible by {block_size}")
+    blocks, half_one = n * (k // block_size), torch.tensor([1.0], dtype=torch.float16).view(torch.uint8)
+    data = torch.randint(0, 16, (blocks * block_bytes,), dtype=torch.uint8)
+    for o in range(0, data.numel(), block_bytes):
+        data[o:o + 2] = half_one
+        if a.quant_type in ("Q4_K", "Q5_K"):
+            data[o + 2:o + 4] = 0; data[o + 4:o + 16] = 1
+        elif a.quant_type == "Q6_K":
+            data[o + 208:o + 210] = half_one; data[o + 192:o + 208] = 1
+    x = torch.randn((m, k) if m > 1 else (k,), device=device, dtype=dtype).contiguous()
+    weight = QuantWeight((n, k), a.quant_type, data.to(device))
+    kernels = get_quant_linear_kernels()
+    with torch.inference_mode():
+        _ = kernels(x, weight)
+        sync()
+        before = torch.mps.driver_allocated_memory()
+        stack, gputrace = capture(f"quant_linear_{a.quant_type.lower()}_"
+                                  f"{'decode' if m == 1 else 'prefill'}_M{m}_K{k}_N{n}")
+        start = perf_counter()
+        with stack, torch.profiler.record_function(f"quant_linear_{a.quant_type}_{'decode' if m == 1 else 'prefill'}"):
+            y = kernels(x, weight)
+            torch.mps.synchronize()
+        elapsed, after = perf_counter() - start, torch.mps.driver_allocated_memory()
+    return {"target": "quant-linear", "kind": "decode" if m == 1 else "prefill", "shape": tuple(x.shape),
+            "weight_shape": weight.shape, "output_shape": tuple(y.shape), "quant_type": a.quant_type,
+            "dtype": str(dtype), "elapsed": elapsed, "mem_before": before, "mem_after": after,
+            "gputrace": gputrace if gputrace and gputrace.exists() else None}
+
+
 def print_summary(r, a):
     print("\n# profile summary")
-    for k in ("target", "kind", "shape", "output_shape", "state_shape", "dtype", "elapsed"):
-        print(f"{k}={r[k]}")
+    for k in ("target", "kind", "shape", "weight_shape", "output_shape", "state_shape", "quant_type",
+              "dtype", "elapsed"):
+        if k in r:
+            print(f"{k}={r[k]}")
     print(f"mem_before={r['mem_before'] / 2**20:.2f}MiB mem_after={r['mem_after'] / 2**20:.2f}MiB")
     if r["gputrace"]:
         print(f"metal_capture={r['gputrace']}")
@@ -97,14 +145,17 @@ def print_summary(r, a):
     elif os.getenv("MTL_CAPTURE_ENABLED"):
         print("metal_capture=unavailable_or_not_persisted")
     else:
-        print(f"metal_capture=disabled; example=MTL_CAPTURE_ENABLED=1 python profile/profile_qwen35.py --target {a.target} --seq-len {a.seq_len}")
+        extra = (f" --quant-type {a.quant_type} --in-features {a.in_features}"
+                 f" --out-features {a.out_features}") if r["target"] == "quant-linear" else ""
+        cmd = f"MTL_CAPTURE_ENABLED=1 python profile/profile_qwen35.py --target {a.target} --seq-len {a.seq_len}"
+        print(f"metal_capture=disabled; example={cmd}{extra}")
 
 
 def main():
     if not torch.backends.mps.is_available():
         raise RuntimeError("MPS is required")
     a = parse_args()
-    registry = {"delta": profile_delta}
+    registry = {"delta": profile_delta, "quant-linear": profile_quant_linear, "quant": profile_quant_linear}
     if a.target not in registry:
         raise ValueError(f"unknown target {a.target!r}; expected one of {', '.join(registry)}")
     print_summary(registry[a.target](a), a)

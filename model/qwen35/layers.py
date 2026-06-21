@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from backend.metal import get_delta_rule_kernels
+from backend.metal import get_delta_rule_kernels, get_quant_linear_kernels
 
 
 def _get(config: Any, name: str, default: Any = None) -> Any:
@@ -37,14 +37,14 @@ class FullAttentionCache:
     max_len: int | None = None
     keys: torch.Tensor | None = None
     values: torch.Tensor | None = None
-    length: torch.Tensor | None = None
+    length: int | None = None
 
     def allocate(self, batch_size: int, num_heads: int, head_dim: int, dtype: torch.dtype, device: torch.device):
         if self.max_len and self.keys is None:
             shape = (batch_size, num_heads, self.max_len, head_dim)
             self.keys = torch.empty(shape, dtype=dtype, device=device)
             self.values = torch.empty(shape, dtype=dtype, device=device)
-            self.length = torch.zeros((), dtype=torch.long, device=device)
+            self.length = 0
 
     def update(self, keys: torch.Tensor, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.max_len:
@@ -52,7 +52,7 @@ class FullAttentionCache:
             idx = self.length + torch.arange(keys.shape[2], device=keys.device)
             self.keys.index_copy_(2, idx, keys)
             self.values.index_copy_(2, idx, values)
-            self.length.add_(keys.shape[2])
+            self.length += keys.shape[2]
             return self.keys, self.values, torch.arange(self.max_len, device=keys.device) < self.length
         elif self.keys is None:
             self.keys = keys
@@ -97,25 +97,41 @@ class Cache:
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.weight = None
+        self.bias = None
+        self.kernels = get_quant_linear_kernels()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        w = self.weight
+        y = F.linear(x, w.data) if w.torch_dtype else self.kernels(x.contiguous(), w)
+        return y if self.bias is None else y + self.bias.data
+
+
+class Embedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype = torch.float16):
+        super().__init__()
+        self.weight = None
+        self.dtype = dtype
+        self.kernels = get_quant_linear_kernels()
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        w = self.weight
+        return F.embedding(ids, w.data) if w.torch_dtype else self.kernels.embed_q4(ids.contiguous(), w, self.dtype)
 
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        self.weight = None
 
-    # Normalization factor over hidden dimension; gamma = 1.0 + weight
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        x = x * (1.0 + self.weight.float())
-        return x.to(input_dtype)
+        weight = 1.0 if self.weight is None else self.weight.data
+        x = x * weight
+        return x.type(input_dtype)
 
 
 # Gate is not related to RMSNorm, their joint appearance is for fusing both ops
@@ -123,17 +139,18 @@ class RMSNormGated(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = None
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        x = self.weight.float() * x
+        weight = 1.0 if self.weight is None else self.weight.data
+        x = weight * x
         x = x * F.silu(
             gate.float()
         )  # gate modulates: SiLU(z) ≈ 0 → suppress, SiLU(z) > 1 → amplify
-        return x.to(input_dtype)
+        return x.type(input_dtype)
 
 
 class MLP(nn.Module):
@@ -175,12 +192,11 @@ class RotaryEmbedding(nn.Module):
 
         inv_freq = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
         pos = position_ids[:, :, None, :].float()
-        freqs = (inv_freq.to(x.device) @ pos.to(x.device)).transpose(2, 3)
+        freqs = (inv_freq @ pos).transpose(2, 3)
         freqs = self._apply_interleaved_mrope(freqs)
         emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().to(dtype=x.dtype).unsqueeze(1)
-        sin = emb.sin().to(dtype=x.dtype).unsqueeze(1)
-
+        cos = emb.cos().type(x.dtype).unsqueeze(1)
+        sin = emb.sin().type(x.dtype).unsqueeze(1)
         q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
         k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
         q = torch.cat((q_rot * cos + _rotate_half(q_rot) * sin, q_pass), dim=-1)
@@ -252,7 +268,7 @@ class FullAttention(nn.Module):
         attn_mask, is_causal = None, False
         if attention_mask is not None:
             if attention_mask.ndim == 2:
-                attn_mask = attention_mask[:, None, None, :].to(torch.bool)
+                attn_mask = attention_mask[:, None, None, :].bool()
             else:
                 attn_mask = attention_mask
         elif key_mask is not None:
@@ -293,10 +309,9 @@ class GatedDeltaNet(nn.Module):
         self.in_proj_z = Linear(self.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.conv1d = nn.Conv1d(self.conv_dim, self.conv_dim, kernel_size=self.conv_kernel_size,
-                                groups=self.conv_dim, padding=self.conv_kernel_size - 1, bias=False)
-        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
-        self.A_log = nn.Parameter(torch.empty(self.num_v_heads).uniform_(0, 16).log_())
+        self.conv1d_weight = None
+        self.dt_bias = None
+        self.A_log = None
         self.norm = RMSNormGated(self.head_v_dim, eps=eps)
         self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
         self.delta_rule_metal = get_delta_rule_kernels()
@@ -304,7 +319,7 @@ class GatedDeltaNet(nn.Module):
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None,
                 cache: DeltaNetCache | None = None) -> torch.Tensor:
         if attention_mask is not None and attention_mask.ndim == 2:
-            hidden_states = hidden_states * attention_mask[:, :, None].to(hidden_states.dtype)
+            hidden_states = hidden_states * attention_mask[:, :, None].type(hidden_states.dtype)
 
         batch_size, seq_len, _ = hidden_states.shape
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
@@ -313,7 +328,7 @@ class GatedDeltaNet(nn.Module):
         beta = torch.sigmoid(self.in_proj_b(hidden_states))
         # Global decay: gt = exp(g), so a highly negative value reduces the impact of St-1 (short term memory)
         #, a lower negative value amplifies the impact of St-1 (long term memory)
-        g = -self.A_log.float().exp() * F.softplus(self.in_proj_a(hidden_states).float() + self.dt_bias)
+        g = -self.A_log.data.float().exp() * F.softplus(self.in_proj_a(hidden_states).float() + self.dt_bias.data)
 
         mixed_qkv = self._causal_conv(mixed_qkv, cache).transpose(1, 2)
 
@@ -341,8 +356,9 @@ class GatedDeltaNet(nn.Module):
 
     def _causal_conv(self, x: torch.Tensor, cache: DeltaNetCache | None) -> torch.Tensor:
         seq_len = x.shape[-1]
+        weight = self.conv1d_weight.data
         if cache is None:
-            return F.silu(self.conv1d(x)[:, :, :seq_len])
+            return F.silu(F.conv1d(x, weight, groups=self.conv_dim, padding=self.conv_kernel_size - 1)[:, :, :seq_len])
 
         prev = cache.conv_state
         conv_input = x if prev is None else torch.cat((prev, x), dim=-1)
@@ -350,8 +366,9 @@ class GatedDeltaNet(nn.Module):
             :, :, -self.conv_kernel_size :
         ].detach()
 
-        output = F.silu(F.conv1d(conv_input, self.conv1d.weight, groups=self.conv_dim)
-                        if prev is not None else self.conv1d(conv_input)[:, :, : conv_input.shape[-1]])
+        output = F.silu(F.conv1d(conv_input, weight, groups=self.conv_dim)
+                        if prev is not None else F.conv1d(conv_input, weight, groups=self.conv_dim,
+                                                          padding=self.conv_kernel_size - 1)[:, :, : conv_input.shape[-1]])
         return output[:, :, -seq_len:]
 
     def _recurrent_delta_rule(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,

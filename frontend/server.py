@@ -21,17 +21,8 @@ class Handler(SimpleHTTPRequestHandler):
         if Handler.engine is not None:
             return
         Handler.loading = True
-        print(
-            f"loading model on {Handler.args.device} with {Handler.args.dtype}",
-            flush=True,
-        )
-        Handler.engine = InferenceEngine(
-            Handler.args.config,
-            Handler.args.weights,
-            Handler.args.tokenizer,
-            device=Handler.args.device,
-            dtype=Handler.args.dtype,
-        )
+        print("loading model on mps with float16", flush=True)
+        Handler.engine = InferenceEngine(Handler.args.weights, Handler.args.tokenizer)
         Handler.loading = False
         print(
             f"model loaded on {Handler.engine.device} with {Handler.engine.dtype}; missing={len(Handler.engine.report['missing'])} unexpected={len(Handler.engine.report['unexpected'])}",
@@ -48,7 +39,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "loading": Handler.loading,
                 "device": ""
                 if not loaded
-                else str(next(Handler.engine.model.parameters()).device),
+                else str(Handler.engine.device),
             }
             payload = json.dumps(body).encode()
             self.send_response(200)
@@ -182,15 +173,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--config", default="config.json")
     parser.add_argument(
-        "--weights", default="weights/unsloth-Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-BF16.gguf"
+        "--weights", default="weights/Qwen3.5-9B-UD-Q4_K_XL.gguf"
     )
-    parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-4B")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps"])
-    parser.add_argument(
-        "--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"]
-    )
+    parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--temperature", type=float)
