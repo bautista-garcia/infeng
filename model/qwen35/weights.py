@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
-
+import time
 
 GGUF_TYPE_NAMES = {0: "F32", 1: "F16", 8: "Q8_0", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 23: "IQ4_XS", 30: "BF16"}
 GGUF_NATIVE_DTYPES = {0: torch.float32, 1: torch.float16, 30: torch.bfloat16}
@@ -162,6 +162,7 @@ def _set(root: torch.nn.Module, dotted: str, value: QuantWeight):
 
 
 def load_weights(model: torch.nn.Module, path: str | Path, strict: bool = False) -> dict[str, Any]:
+    load_t0 = time.perf_counter()
     f, _, data_start, infos = _gguf(Path(path))
     mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
     handles, loaded, unexpected = getattr(model, "_gguf_handles", []), set(), []
@@ -179,8 +180,7 @@ def load_weights(model: torch.nn.Module, path: str | Path, strict: bool = False)
             numel = int(np.prod(shape))
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
-                data = torch.frombuffer(mm, dtype=dtype, count=numel, offset=data_start + offset)
-            data = data.reshape(shape)
+                data = torch.frombuffer(mm, dtype=dtype, count=numel, offset=data_start + offset).reshape(shape).to(device)
             if transform == "neg_log":
                 data = torch.log(-data.float())
             elif transform == "conv1d":
@@ -192,13 +192,15 @@ def load_weights(model: torch.nn.Module, path: str | Path, strict: bool = False)
             nbytes = int(np.prod(shape[:-1])) * (shape[-1] // block_size) * block_bytes
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
-                data = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes, offset=data_start + offset)
-        _set(model, target_key, QuantWeight(source_key, shape, typ, data.to(device) if device else data,
+                data = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes, offset=data_start + offset).to(device)
+                # Data moved to mps device
+        _set(model, target_key, QuantWeight(source_key, shape, typ, data,
                                             data_start + offset, nbytes, block_size, block_bytes, transform))
         loaded.add(target_key)
     missing = sorted(k for k in _expected(model) if k not in loaded)
     if strict and (missing or unexpected):
         raise RuntimeError(f"missing={missing[:20]} unexpected={unexpected[:20]}")
+    print(f"GGUF weights loaded in {time.perf_counter() - load_t0:.3f}s")
     return {"missing": missing, "unexpected": unexpected}
 
 
