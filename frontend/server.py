@@ -24,10 +24,7 @@ class Handler(SimpleHTTPRequestHandler):
         print("loading model on mps with float16", flush=True)
         Handler.engine = InferenceEngine(Handler.args.weights, Handler.args.tokenizer)
         Handler.loading = False
-        print(
-            f"model loaded on {Handler.engine.device} with {Handler.engine.dtype}; missing={len(Handler.engine.report['missing'])} unexpected={len(Handler.engine.report['unexpected'])}",
-            flush=True,
-        )
+        print(f"model loaded on {Handler.engine.device} with {Handler.engine.dtype}", flush=True)
 
     def do_GET(self):
         if self.path == "/":

@@ -14,7 +14,7 @@ class InferenceEngine:
     def __init__(self, weights: str | Path, tokenizer: str):
         self.device, self.dtype = torch.device("mps"), torch.float16
         self.model = ForCausalLM(weights).eval()
-        self.report = load_weights(self.model, weights)
+        load_weights(self.model, weights)
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
         self.paged_attention = self.prefix_cache = None
 

@@ -2,18 +2,31 @@ from __future__ import annotations
 
 import mmap
 import struct
-import warnings
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-import time
 
 GGUF_TYPE_NAMES = {0: "F32", 1: "F16", 8: "Q8_0", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 23: "IQ4_XS", 30: "BF16"}
 GGUF_NATIVE_DTYPES = {0: torch.float32, 1: torch.float16, 30: torch.bfloat16}
 GGUF_BLOCK = {"Q8_0": (32, 34), "Q4_K": (256, 144), "Q5_K": (256, 176), "Q6_K": (256, 210), "IQ4_XS": (256, 136)}
+GGUF_TARGETS = {"token_embd.weight": "model.embed_tokens.weight", "output.weight": "lm_head.weight",
+                "output_norm.weight": "model.norm.weight", "model.output_norm.weight": "model.norm.weight"}
+GGUF_BLOCK_TARGETS = {
+    "attn_norm.weight": "input_layernorm.weight", "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "ffn_norm.weight": "post_attention_layernorm.weight", "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_up.weight": "mlp.up_proj.weight", "ffn_down.weight": "mlp.down_proj.weight",
+    "attn_q.weight": "self_attn.q_proj.weight", "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight", "attn_output.weight": "self_attn.o_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight", "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "attn_qkv.weight": "linear_attn.in_proj_qkv.weight", "attn_gate.weight": "linear_attn.in_proj_z.weight",
+    "ssm_beta.weight": "linear_attn.in_proj_b.weight", "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
+    "ssm_conv1d.weight": "linear_attn.conv1d_weight", "ssm_out.weight": "linear_attn.out_proj.weight",
+    "ssm_norm.weight": "linear_attn.norm.weight", "ssm_dt.bias": "linear_attn.dt_bias", "ssm_a": "linear_attn.A_log",
+}
 
 
 def _string(f) -> str:
@@ -129,28 +142,12 @@ class QuantWeight:
 
 
 def _target(key: str) -> tuple[str, str | None] | None:
-    if key == "token_embd.weight":
-        return "model.embed_tokens.weight", None
-    if key == "output.weight":
-        return "lm_head.weight", None
-    if key in ("output_norm.weight", "model.output_norm.weight"):
-        return "model.norm.weight", None
+    if key in GGUF_TARGETS:
+        return GGUF_TARGETS[key], None
     parts = key.split(".")
     if len(parts) < 3 or parts[0] != "blk":
         return None
-    names = {
-        "attn_norm.weight": "input_layernorm.weight", "post_attention_norm.weight": "post_attention_layernorm.weight",
-        "ffn_norm.weight": "post_attention_layernorm.weight", "ffn_gate.weight": "mlp.gate_proj.weight",
-        "ffn_up.weight": "mlp.up_proj.weight", "ffn_down.weight": "mlp.down_proj.weight",
-        "attn_q.weight": "self_attn.q_proj.weight", "attn_k.weight": "self_attn.k_proj.weight",
-        "attn_v.weight": "self_attn.v_proj.weight", "attn_output.weight": "self_attn.o_proj.weight",
-        "attn_q_norm.weight": "self_attn.q_norm.weight", "attn_k_norm.weight": "self_attn.k_norm.weight",
-        "attn_qkv.weight": "linear_attn.in_proj_qkv.weight", "attn_gate.weight": "linear_attn.in_proj_z.weight",
-        "ssm_beta.weight": "linear_attn.in_proj_b.weight", "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
-        "ssm_conv1d.weight": "linear_attn.conv1d_weight", "ssm_out.weight": "linear_attn.out_proj.weight",
-        "ssm_norm.weight": "linear_attn.norm.weight", "ssm_dt.bias": "linear_attn.dt_bias", "ssm_a": "linear_attn.A_log",
-    }
-    attr = names.get(".".join(parts[2:]))
+    attr = GGUF_BLOCK_TARGETS.get(".".join(parts[2:]))
     return (f"model.layers.{parts[1]}.{attr}", "conv1d" if attr == "linear_attn.conv1d_weight" else "neg_log" if attr == "linear_attn.A_log" else None) if attr else None
 
 
@@ -161,59 +158,37 @@ def _set(root: torch.nn.Module, dotted: str, value: QuantWeight):
     setattr(obj, dotted.rsplit(".", 1)[1], value)
 
 
-def load_weights(model: torch.nn.Module, path: str | Path, strict: bool = False) -> dict[str, Any]:
+def load_weights(model: torch.nn.Module, path: str | Path) -> None:
     load_t0 = time.perf_counter()
     f, _, data_start, infos = _gguf(Path(path))
     mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    handles, loaded, unexpected = getattr(model, "_gguf_handles", []), set(), []
+    handles = getattr(model, "_gguf_handles", [])
     handles.append((f, mm)); model._gguf_handles = handles
     device, model_dtype = getattr(model, "device", None), getattr(model, "dtype", None)
     for source_key, shape, typ, offset in infos:
         mapped = _target(source_key)
         if mapped is None:
-            unexpected.append(source_key); continue
+            continue
         target_key, transform = mapped
         if not hasattr(model.get_submodule(target_key.rsplit(".", 1)[0]), target_key.rsplit(".", 1)[1]):
-            unexpected.append(source_key); continue
+            continue
         dtype = GGUF_NATIVE_DTYPES.get(typ)
+        # Torch dtype
         if dtype:
             numel = int(np.prod(shape))
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                data = torch.frombuffer(mm, dtype=dtype, count=numel, offset=data_start + offset).reshape(shape).to(device)
+            data = torch.frombuffer(mm, dtype=dtype, count=numel, offset=data_start + offset).reshape(shape).to(device)
             if transform == "neg_log":
                 data = torch.log(-data.float())
             elif transform == "conv1d":
                 data = data[:, None, :].to(dtype=model_dtype or data.dtype)
             shape = tuple(data.shape)
             nbytes, block_size, block_bytes = numel * data.element_size(), None, None
+        # Quant dtype
         else:
             block_size, block_bytes = GGUF_BLOCK[GGUF_TYPE_NAMES[typ]]
             nbytes = int(np.prod(shape[:-1])) * (shape[-1] // block_size) * block_bytes
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                data = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes, offset=data_start + offset).to(device)
-                # Data moved to mps device
+            data = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes, offset=data_start + offset).to(device)
         _set(model, target_key, QuantWeight(source_key, shape, typ, data,
                                             data_start + offset, nbytes, block_size, block_bytes, transform))
-        loaded.add(target_key)
-    missing = sorted(k for k in _expected(model) if k not in loaded)
-    if strict and (missing or unexpected):
-        raise RuntimeError(f"missing={missing[:20]} unexpected={unexpected[:20]}")
     print(f"GGUF weights loaded in {time.perf_counter() - load_t0:.3f}s")
-    return {"missing": missing, "unexpected": unexpected}
 
-
-def _expected(model: torch.nn.Module) -> set[str]:
-    out = {"model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"}
-    for i, layer in enumerate(model.model.layers):
-        p = f"model.layers.{i}."
-        out |= {p + "input_layernorm.weight", p + "post_attention_layernorm.weight",
-                p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight", p + "mlp.down_proj.weight"}
-        if layer.layer_type == "full_attention":
-            out |= {p + f"self_attn.{x}.weight" for x in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")}
-        else:
-            out |= {p + f"linear_attn.{x}" for x in ("in_proj_qkv.weight", "in_proj_z.weight", "in_proj_b.weight",
-                                                      "in_proj_a.weight", "conv1d_weight", "dt_bias", "A_log",
-                                                      "norm.weight", "out_proj.weight")}
-    return out
