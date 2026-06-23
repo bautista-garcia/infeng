@@ -40,28 +40,18 @@ kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]
                  uint3 group [[threadgroup_position_in_grid]]) { \
     uint lane = lane3.x, rb = simd_group * 8; \
     long n0 = long(group.x) * 16, m0 = long(group.y) * 32; \
-    bool full_m = m0 + 32 <= M; \
-    threadgroup half b_tile[256 * 16], a_tail[4 * 64]; \
+    threadgroup half b_tile[256 * 16]; \
     threadgroup float scratch[4 * 2 * 64]; \
     simdgroup_matrix<float, 8, 8> c0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \
     simdgroup_matrix<float, 8, 8> c1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); \
     for (long k0 = 0; k0 < K; k0 += 256) { \
         long kb = k0 / 256; \
+        device const half* x_ptr = x + m0 * K + k0; \
         Q4K_DEQUANT_TILE(16, K) \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
         simdgroup_matrix<half, 8, 8> a, b; \
         for (uint ko = 0; ko < 256; ko += 8) { \
-            if (full_m) { \
-                simdgroup_load(a, x + m0 * K + k0, K, ulong2(ko, rb)); \
-            } else { \
-                threadgroup half* at = a_tail + simd_group * 64; \
-                for (uint e = simd_lane; e < 64; e += 32) { \
-                    uint r = e / 8, c = e % 8; \
-                    at[e] = m0 + rb + r < M ? x[(m0 + rb + r) * K + k0 + ko + c] : half(0.0f); \
-                } \
-                simdgroup_barrier(mem_flags::mem_threadgroup); \
-                simdgroup_load(a, at, 8, ulong2(0, 0)); \
-            } \
+            simdgroup_load(a, x_ptr, K, ulong2(ko, rb)); \
             simdgroup_load(b, b_tile, 16, ulong2(0, ko)); simdgroup_multiply_accumulate(c0, a, b, c0); \
             simdgroup_load(b, b_tile, 16, ulong2(8, ko)); simdgroup_multiply_accumulate(c1, a, b, c1); \
         } \
@@ -72,7 +62,7 @@ kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]
     threadgroup_barrier(mem_flags::mem_threadgroup); \
     for (uint idx = lane; idx < 32 * 16; idx += 128) { \
         uint r = idx / 16, c = idx % 16, g = r / 8, e = (r % 8) * 8 + c % 8; \
-        if (m0 + r < M) y[(m0 + r) * N + n0 + c] = half(scratch[g * 128 + (c / 8) * 64 + e]); \
+        y[(m0 + r) * N + n0 + c] = half(scratch[g * 128 + (c / 8) * 64 + e]); \
     } \
 }
 
@@ -81,4 +71,3 @@ PREFILL_Q4K_V2_BN16(q4_k_k4096_n4096_prefill_v2_bn16, 4096, 4096)
 PREFILL_Q4K_V2_BN16(q4_k_k12288_n4096_prefill_v2_bn16, 12288, 4096)
 PREFILL_Q4K_V2_BN16(q4_k_k4096_n8192_prefill_v2_bn16, 4096, 8192)
 PREFILL_Q4K_V2_BN16(q4_k_k4096_n12288_prefill_v2_bn16, 4096, 12288)
-
