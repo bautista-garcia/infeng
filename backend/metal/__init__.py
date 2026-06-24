@@ -73,7 +73,6 @@ class QuantLinearKernels:
         m, k, n = x.numel() // x.shape[-1], x.shape[-1], weight.shape[0]
         if k != weight.shape[1]:
             raise RuntimeError(f"quant linear expects x=(...,K), weight=(N,K); got {x.shape}, {weight.shape}")
-        y = torch.empty((*x.shape[:-1], n), dtype=x.dtype, device=x.device)
         registry = {
             ("Q4_K", 4096, 1024): (self.lib.q4_k_k4096_n1024_decode, self.v2.q4_k_k4096_n1024_prefill_v2_bn16, "v2"),
             ("Q4_K", 4096, 4096): (self.lib.q4_k_k4096_n4096_decode, self.v2.q4_k_k4096_n4096_prefill_v2_bn16, "v2"),
@@ -95,17 +94,16 @@ class QuantLinearKernels:
         if (weight.type_name, k, n) not in registry:
             raise RuntimeError(f"unsupported quant linear specialization {(weight.type_name, k, n)}")
         decode, prefill, kind = registry[(weight.type_name, k, n)]
+        if kind == "v2" and m != 1:
+            x2, mpad = x.reshape(m, k), (m + 31) // 32 * 32
+            x2 = x2 if mpad == m else torch.nn.functional.pad(x2, (0, 0, 0, mpad - m))
+            y2 = torch.empty((mpad, n), dtype=x.dtype, device=x.device)
+            prefill(y2, x2, weight.data, mpad, threads=[128 * (n // 16), mpad // 32, 1], group_size=[128, 1, 1])
+            return y2[:m].reshape(*x.shape[:-1], n)
+
+        y = torch.empty((*x.shape[:-1], n), dtype=x.dtype, device=x.device)
         if m == 1:
             decode(y, x, weight.data, threads=[32, (n + 3) // 4, 1], group_size=[32, 1, 1])
-        elif kind == "v2":
-            x2, y2, mpad = x.reshape(m, k), y.reshape(m, n), (m + 31) // 32 * 32
-            if mpad != m:
-                xp, yp = torch.zeros((mpad, k), dtype=x.dtype, device=x.device), torch.empty((mpad, n), dtype=x.dtype, device=x.device)
-                xp[:m].copy_(x2)
-                prefill(yp, xp, weight.data, mpad, threads=[128 * (n // 16), mpad // 32, 1], group_size=[128, 1, 1])
-                y2.copy_(yp[:m])
-            else:
-                prefill(y2, x2, weight.data, m, threads=[128 * (n // 16), m // 32, 1], group_size=[128, 1, 1])
         else:
             threads = [32, (n + 3) // 4, m]
             prefill(y, x, weight.data, m, threads=threads, group_size=[threads[0], 1, 1])
