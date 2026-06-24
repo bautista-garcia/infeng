@@ -57,12 +57,14 @@ kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]
         } \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
     } \
-    simdgroup_store(c0, scratch + simd_group * 128, 8); \
-    simdgroup_store(c1, scratch + simd_group * 128 + 64, 8); \
+    simdgroup_store(c0, scratch + simd_group * 128, 16); \
+    simdgroup_store(c1, scratch + simd_group * 128 + 8, 16); \
     threadgroup_barrier(mem_flags::mem_threadgroup); \
-    for (uint idx = lane; idx < 32 * 16; idx += 128) { \
-        uint r = idx / 16, c = idx % 16, g = r / 8, e = (r % 8) * 8 + c % 8; \
-        y[(m0 + r) * N + n0 + c] = half(scratch[g * 128 + (c / 8) * 64 + e]); \
+    device half2* y2 = reinterpret_cast<device half2*>(y); \
+    for (uint idx = lane; idx < 32 * 8; idx += 128) { \
+        uint r = idx >> 3, cp = idx & 7, e = ((r & 7) << 4) + (cp << 1); \
+        y2[((m0 + r) * N + n0 + (cp << 1)) >> 1] = half2(half(scratch[(r >> 3) * 128 + e]), \
+                                                          half(scratch[(r >> 3) * 128 + e + 1])); \
     } \
 }
 
