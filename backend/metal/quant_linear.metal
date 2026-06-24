@@ -12,8 +12,10 @@ static inline half h16(device const uchar* p) {
 
 static inline void scale_min_k4(uint j, device const uchar* q, thread uchar& d, thread uchar& m) {
     if (j < 4) {
-        d = q[j] & 63; m = q[j + 4] & 63;
+        // Extract sj and mj (63 = 0b00111111) from the s0..s3 and m0..m3 group
+        d = q[j] & 63; m = q[j + 4] & 63; 
     } else {
+        // Extract sj and mj from the s4..s7 and m4..m7 group
         d = (q[j + 4] & 15) | ((q[j - 4] >> 6) << 4);
         m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
@@ -38,6 +40,7 @@ static inline float q4_dot32(device const half* x, device const uchar* w, long K
 }
 
 static inline half q4_val(device const uchar* w, long K, uint row, uint col) {
+    // Indexing from (row,col) into (blk)
     long nb = K / 256, b = col >> 8, r = col & 255, o = row * nb * 144 + b * 144;
     float d = float(h16(w + o)), dm = float(h16(w + o + 2));
     uint j = r >> 5, qj = (r >> 6) * 32 + (r & 31);

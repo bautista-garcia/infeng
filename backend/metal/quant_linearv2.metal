@@ -31,7 +31,47 @@ static inline void scale_min_k4(uint j, device const uchar* q, thread uchar& d, 
         } \
     }
 
-#define PREFILL_Q4K_V2_BN16(name, K, N) \
+#define Q5K_DEQUANT_TILE(BN, K) \
+    for (uint p = 0; p < BN / 4; ++p) { \
+        uint n = simd_group * (BN / 4) + p; \
+        long o = long(n0 + n) * (K / 256) * 176 + kb * 176; \
+        float d = float(h16(w + o)), dm = float(h16(w + o + 2)); \
+        uchar hm = w[o + 16 + simd_lane]; \
+        for (uint t = 0; t < 4; ++t) { \
+            uchar sc, mn, q = w[o + 48 + t * 32 + simd_lane]; \
+            uint r = t * 64 + simd_lane, j = t * 2; \
+            scale_min_k4(j, w + o + 4, sc, mn); \
+            b_tile[r * BN + n] = half(d * float(sc) * float((q & 15) + ((hm & (1 << j)) ? 16 : 0)) - dm * float(mn)); \
+            scale_min_k4(j + 1, w + o + 4, sc, mn); \
+            b_tile[(r + 32) * BN + n] = half(d * float(sc) * float((q >> 4) + ((hm & (1 << (j + 1))) ? 16 : 0)) - dm * float(mn)); \
+        } \
+    }
+
+#define Q6K_DEQUANT_TILE(BN, K) \
+    for (uint p = 0; p < BN / 4; ++p) { \
+        uint n = simd_group * (BN / 4) + p, l = simd_lane; \
+        long o = long(n0 + n) * (K / 256) * 210 + kb * 210; \
+        float d = float(h16(w + o + 208)); \
+        for (uint h = 0; h < 2; ++h) for (uint s = 0; s < 4; ++s) { \
+            uint rr = s * 32 + l, qlo = h * 64 + ((rr & 32) ? 32 : 0) + l, r = h * 128 + rr; \
+            uchar q = w[o + qlo], lo = (rr & 64) ? (q >> 4) : (q & 15); \
+            uchar hi = (w[o + 128 + h * 32 + l] >> (2 * s)) & 3; \
+            char sc = char(w[o + 192 + h * 8 + (rr >> 4)]); \
+            b_tile[r * BN + n] = half(d * float(sc) * (float((hi << 4) | lo) - 32.0f)); \
+        } \
+    }
+
+#define Q8_0_DEQUANT_TILE(BN, K) \
+    for (uint p = 0; p < BN / 4; ++p) { \
+        uint n = simd_group * (BN / 4) + p; \
+        long base = long(n0 + n) * (K / 32) * 34 + kb * 8 * 34; \
+        for (uint t = 0; t < 8; ++t) { \
+            long o = base + t * 34; \
+            b_tile[(t * 32 + simd_lane) * BN + n] = half(float(h16(w + o)) * float(char(w[o + 2 + simd_lane]))); \
+        } \
+    }
+
+#define PREFILL_QK_V2_BN16(name, dequant, K, N) \
 [[max_total_threads_per_threadgroup(128)]] \
 kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], \
                  device const uchar* w [[buffer(2)]], constant long& M [[buffer(3)]], \
@@ -47,7 +87,7 @@ kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]
     for (long k0 = 0; k0 < K; k0 += 256) { \
         long kb = k0 / 256; \
         device const half* x_ptr = x + m0 * K + k0; \
-        Q4K_DEQUANT_TILE(16, K) \
+        dequant(16, K) \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
         simdgroup_matrix<half, 8, 8> a, b; \
         for (uint ko = 0; ko < 256; ko += 8) { \
@@ -68,8 +108,20 @@ kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]
     } \
 }
 
-PREFILL_Q4K_V2_BN16(q4_k_k4096_n1024_prefill_v2_bn16, 4096, 1024)
-PREFILL_Q4K_V2_BN16(q4_k_k4096_n4096_prefill_v2_bn16, 4096, 4096)
-PREFILL_Q4K_V2_BN16(q4_k_k12288_n4096_prefill_v2_bn16, 12288, 4096)
-PREFILL_Q4K_V2_BN16(q4_k_k4096_n8192_prefill_v2_bn16, 4096, 8192)
-PREFILL_Q4K_V2_BN16(q4_k_k4096_n12288_prefill_v2_bn16, 4096, 12288)
+PREFILL_QK_V2_BN16(q4_k_k4096_n1024_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 1024)
+PREFILL_QK_V2_BN16(q4_k_k4096_n4096_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 4096)
+PREFILL_QK_V2_BN16(q4_k_k12288_n4096_prefill_v2_bn16, Q4K_DEQUANT_TILE, 12288, 4096)
+PREFILL_QK_V2_BN16(q4_k_k4096_n8192_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 8192)
+PREFILL_QK_V2_BN16(q4_k_k4096_n12288_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 12288)
+
+PREFILL_QK_V2_BN16(q5_k_k4096_n1024_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 1024)
+PREFILL_QK_V2_BN16(q5_k_k4096_n4096_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 4096)
+PREFILL_QK_V2_BN16(q5_k_k12288_n4096_prefill_v2_bn16, Q5K_DEQUANT_TILE, 12288, 4096)
+PREFILL_QK_V2_BN16(q5_k_k4096_n8192_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 8192)
+PREFILL_QK_V2_BN16(q5_k_k4096_n12288_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 12288)
+
+PREFILL_QK_V2_BN16(q6_k_k4096_n1024_prefill_v2_bn16, Q6K_DEQUANT_TILE, 4096, 1024)
+PREFILL_QK_V2_BN16(q6_k_k12288_n4096_prefill_v2_bn16, Q6K_DEQUANT_TILE, 12288, 4096)
+PREFILL_QK_V2_BN16(q6_k_k4096_n248320_prefill_v2_bn16, Q6K_DEQUANT_TILE, 4096, 248320)
+
+PREFILL_QK_V2_BN16(q8_0_k4096_n4096_prefill_v2_bn16, Q8_0_DEQUANT_TILE, 4096, 4096)

@@ -165,6 +165,7 @@ def load_weights(model: torch.nn.Module, path: str | Path) -> None:
     handles = getattr(model, "_gguf_handles", [])
     handles.append((f, mm)); model._gguf_handles = handles
     device, model_dtype = getattr(model, "device", None), getattr(model, "dtype", None)
+    # Loop through each layer's weights (reading metadata and getting file offsets to build mmaps)
     for source_key, shape, typ, offset in infos:
         mapped = _target(source_key)
         if mapped is None:

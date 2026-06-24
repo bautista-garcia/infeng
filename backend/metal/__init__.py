@@ -67,6 +67,7 @@ def get_delta_rule_kernels() -> DeltaRuleKernels:
 @dataclass
 class QuantLinearKernels:
     lib: object
+    v2: object
 
     def __call__(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
         m, k, n = x.numel() // x.shape[-1], x.shape[-1], weight.shape[0]
@@ -74,20 +75,20 @@ class QuantLinearKernels:
             raise RuntimeError(f"quant linear expects x=(...,K), weight=(N,K); got {x.shape}, {weight.shape}")
         y = torch.empty((*x.shape[:-1], n), dtype=x.dtype, device=x.device)
         registry = {
-            ("Q4_K", 4096, 1024): (self.lib.q4_k_k4096_n1024_decode, self.lib.q4_k_k4096_n1024_prefill, "mma"),
-            ("Q4_K", 4096, 4096): (self.lib.q4_k_k4096_n4096_decode, self.lib.q4_k_k4096_n4096_prefill, "mma"),
-            ("Q4_K", 12288, 4096): (self.lib.q4_k_k12288_n4096_decode, self.lib.q4_k_k12288_n4096_prefill, "mma"),
-            ("Q4_K", 4096, 8192): (self.lib.q4_k_k4096_n8192_decode, self.lib.q4_k_k4096_n8192_prefill, "mma"),
-            ("Q4_K", 4096, 12288): (self.lib.q4_k_k4096_n12288_decode, self.lib.q4_k_k4096_n12288_prefill, "mma"),
-            ("Q5_K", 4096, 1024): (self.lib.q5_k_k4096_n1024_decode, self.lib.q5_k_k4096_n1024_prefill, "mma"),
-            ("Q5_K", 4096, 4096): (self.lib.q5_k_k4096_n4096_decode, self.lib.q5_k_k4096_n4096_prefill, "mma"),
-            ("Q5_K", 12288, 4096): (self.lib.q5_k_k12288_n4096_decode, self.lib.q5_k_k12288_n4096_prefill, "mma"),
-            ("Q5_K", 4096, 8192): (self.lib.q5_k_k4096_n8192_decode, self.lib.q5_k_k4096_n8192_prefill, "mma"),
-            ("Q5_K", 4096, 12288): (self.lib.q5_k_k4096_n12288_decode, self.lib.q5_k_k4096_n12288_prefill, "mma"),
-            ("Q6_K", 4096, 1024): (self.lib.q6_k_k4096_n1024_decode, self.lib.q6_k_k4096_n1024_prefill, "mma"),
-            ("Q6_K", 12288, 4096): (self.lib.q6_k_k12288_n4096_decode, self.lib.q6_k_k12288_n4096_prefill, "mma"),
-            ("Q6_K", 4096, 248320): (self.lib.q6_k_k4096_n248320_decode, self.lib.q6_k_k4096_n248320_prefill, "mma"),
-            ("Q8_0", 4096, 4096): (self.lib.q8_0_k4096_n4096_decode, self.lib.q8_0_k4096_n4096_prefill, "mma"),
+            ("Q4_K", 4096, 1024): (self.lib.q4_k_k4096_n1024_decode, self.v2.q4_k_k4096_n1024_prefill_v2_bn16, "v2"),
+            ("Q4_K", 4096, 4096): (self.lib.q4_k_k4096_n4096_decode, self.v2.q4_k_k4096_n4096_prefill_v2_bn16, "v2"),
+            ("Q4_K", 12288, 4096): (self.lib.q4_k_k12288_n4096_decode, self.v2.q4_k_k12288_n4096_prefill_v2_bn16, "v2"),
+            ("Q4_K", 4096, 8192): (self.lib.q4_k_k4096_n8192_decode, self.v2.q4_k_k4096_n8192_prefill_v2_bn16, "v2"),
+            ("Q4_K", 4096, 12288): (self.lib.q4_k_k4096_n12288_decode, self.v2.q4_k_k4096_n12288_prefill_v2_bn16, "v2"),
+            ("Q5_K", 4096, 1024): (self.lib.q5_k_k4096_n1024_decode, self.v2.q5_k_k4096_n1024_prefill_v2_bn16, "v2"),
+            ("Q5_K", 4096, 4096): (self.lib.q5_k_k4096_n4096_decode, self.v2.q5_k_k4096_n4096_prefill_v2_bn16, "v2"),
+            ("Q5_K", 12288, 4096): (self.lib.q5_k_k12288_n4096_decode, self.v2.q5_k_k12288_n4096_prefill_v2_bn16, "v2"),
+            ("Q5_K", 4096, 8192): (self.lib.q5_k_k4096_n8192_decode, self.v2.q5_k_k4096_n8192_prefill_v2_bn16, "v2"),
+            ("Q5_K", 4096, 12288): (self.lib.q5_k_k4096_n12288_decode, self.v2.q5_k_k4096_n12288_prefill_v2_bn16, "v2"),
+            ("Q6_K", 4096, 1024): (self.lib.q6_k_k4096_n1024_decode, self.v2.q6_k_k4096_n1024_prefill_v2_bn16, "v2"),
+            ("Q6_K", 12288, 4096): (self.lib.q6_k_k12288_n4096_decode, self.v2.q6_k_k12288_n4096_prefill_v2_bn16, "v2"),
+            ("Q6_K", 4096, 248320): (self.lib.q6_k_k4096_n248320_decode, self.v2.q6_k_k4096_n248320_prefill_v2_bn16, "v2"),
+            ("Q8_0", 4096, 4096): (self.lib.q8_0_k4096_n4096_decode, self.v2.q8_0_k4096_n4096_prefill_v2_bn16, "v2"),
             ("IQ4_XS", 4096, 12288): (self.lib.iq4_xs_k4096_n12288_decode,
                                        self.lib.iq4_xs_k4096_n12288_prefill, "scalar"),
         }
@@ -96,8 +97,17 @@ class QuantLinearKernels:
         decode, prefill, kind = registry[(weight.type_name, k, n)]
         if m == 1:
             decode(y, x, weight.data, threads=[32, (n + 3) // 4, 1], group_size=[32, 1, 1])
+        elif kind == "v2":
+            x2, y2, mpad = x.reshape(m, k), y.reshape(m, n), (m + 31) // 32 * 32
+            if mpad != m:
+                xp, yp = torch.zeros((mpad, k), dtype=x.dtype, device=x.device), torch.empty((mpad, n), dtype=x.dtype, device=x.device)
+                xp[:m].copy_(x2)
+                prefill(yp, xp, weight.data, mpad, threads=[128 * (n // 16), mpad // 32, 1], group_size=[128, 1, 1])
+                y2.copy_(yp[:m])
+            else:
+                prefill(y2, x2, weight.data, m, threads=[128 * (n // 16), m // 32, 1], group_size=[128, 1, 1])
         else:
-            threads = [128, n // 32, (m + 31) // 32] if kind == "mma" else [32, (n + 3) // 4, m]
+            threads = [32, (n + 3) // 4, m]
             prefill(y, x, weight.data, m, threads=threads, group_size=[threads[0], 1, 1])
         return y
 
@@ -113,5 +123,6 @@ def get_quant_linear_kernels() -> QuantLinearKernels:
     global _QUANT_LINEAR_KERNELS
     if _QUANT_LINEAR_KERNELS is None:
         source = (Path(__file__).with_name("quant_linear.metal")).read_text()
-        _QUANT_LINEAR_KERNELS = QuantLinearKernels(torch.mps.compile_shader(source))
+        source_v2 = (Path(__file__).with_name("quant_linearv2.metal")).read_text()
+        _QUANT_LINEAR_KERNELS = QuantLinearKernels(torch.mps.compile_shader(source), torch.mps.compile_shader(source_v2))
     return _QUANT_LINEAR_KERNELS
