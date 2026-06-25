@@ -108,32 +108,27 @@ kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]
     } \
 }
 
-#define DECODE_Q4K_V2_TG(name, TG, NSIMD, K, N) \
+#define DECODE_Q4K_V2_REG_TG(name, TG, NSIMD, K, N) \
 [[max_total_threads_per_threadgroup(TG)]] \
 kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], \
-                 device const uchar* w [[buffer(2)]], uint3 lane3 [[thread_position_in_threadgroup]], \
-                 uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]], \
-                 uint3 group [[threadgroup_position_in_grid]]) { \
-    uint lane = lane3.x, row = group.x * NSIMD + simd_group; \
-    threadgroup half x_tile[256]; \
+                 device const uchar* w [[buffer(2)]], uint simd_lane [[thread_index_in_simdgroup]], \
+                 uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) { \
+    uint row = group.x * NSIMD + simd_group; \
     float acc = 0.0f; \
-    for (long kb = 0; kb < K / 256; ++kb) { \
-        long k0 = kb * 256; \
-        for (uint i = lane; i < 256; i += TG) x_tile[i] = x[k0 + i]; \
-        threadgroup_barrier(mem_flags::mem_threadgroup); \
-        if (row < N) { \
-            long o = long(row) * (K / 256) * 144 + kb * 144; \
-            float d = float(h16(w + o)), dm = float(h16(w + o + 2)); \
-            for (uint t = 0; t < 4; ++t) { \
-                uchar sc, mn, q = w[o + 16 + t * 32 + simd_lane]; \
-                uint r = t * 64 + simd_lane, j = t * 2; \
-                scale_min_k4(j, w + o + 4, sc, mn); \
-                acc = fma(float(x_tile[r]), d * float(sc) * float(q & 15) - dm * float(mn), acc); \
-                scale_min_k4(j + 1, w + o + 4, sc, mn); \
-                acc = fma(float(x_tile[r + 32]), d * float(sc) * float(q >> 4) - dm * float(mn), acc); \
-            } \
-        } \
-        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    if (row < N) for (long kb = 0; kb < K / 256; ++kb) { \
+        long k0 = kb * 256, o = long(row) * (K / 256) * 144 + kb * 144; \
+        float d = float(h16(w + o)), dm = float(h16(w + o + 2)); \
+        half x0 = x[k0 + simd_lane], x1 = x[k0 + simd_lane + 32], x2 = x[k0 + simd_lane + 64], x3 = x[k0 + simd_lane + 96]; \
+        half x4 = x[k0 + simd_lane + 128], x5 = x[k0 + simd_lane + 160], x6 = x[k0 + simd_lane + 192], x7 = x[k0 + simd_lane + 224]; \
+        uchar sc, mn, q0 = w[o + 16 + simd_lane], q1 = w[o + 48 + simd_lane], q2 = w[o + 80 + simd_lane], q3 = w[o + 112 + simd_lane]; \
+        scale_min_k4(0, w + o + 4, sc, mn); acc = fma(float(x0), d * float(sc) * float(q0 & 15) - dm * float(mn), acc); \
+        scale_min_k4(1, w + o + 4, sc, mn); acc = fma(float(x1), d * float(sc) * float(q0 >> 4) - dm * float(mn), acc); \
+        scale_min_k4(2, w + o + 4, sc, mn); acc = fma(float(x2), d * float(sc) * float(q1 & 15) - dm * float(mn), acc); \
+        scale_min_k4(3, w + o + 4, sc, mn); acc = fma(float(x3), d * float(sc) * float(q1 >> 4) - dm * float(mn), acc); \
+        scale_min_k4(4, w + o + 4, sc, mn); acc = fma(float(x4), d * float(sc) * float(q2 & 15) - dm * float(mn), acc); \
+        scale_min_k4(5, w + o + 4, sc, mn); acc = fma(float(x5), d * float(sc) * float(q2 >> 4) - dm * float(mn), acc); \
+        scale_min_k4(6, w + o + 4, sc, mn); acc = fma(float(x6), d * float(sc) * float(q3 & 15) - dm * float(mn), acc); \
+        scale_min_k4(7, w + o + 4, sc, mn); acc = fma(float(x7), d * float(sc) * float(q3 >> 4) - dm * float(mn), acc); \
     } \
     acc = simd_sum(acc); \
     if (row < N && simd_lane == 0) y[row] = half(acc); \
@@ -145,16 +140,11 @@ PREFILL_QK_V2_BN16(q4_k_k12288_n4096_prefill_v2_bn16, Q4K_DEQUANT_TILE, 12288, 4
 PREFILL_QK_V2_BN16(q4_k_k4096_n8192_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 8192)
 PREFILL_QK_V2_BN16(q4_k_k4096_n12288_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 12288)
 
-DECODE_Q4K_V2_TG(q4_k_k4096_n1024_decode_v2_tg128, 128, 4, 4096, 1024)
-DECODE_Q4K_V2_TG(q4_k_k4096_n1024_decode_v2_tg256, 256, 8, 4096, 1024)
-DECODE_Q4K_V2_TG(q4_k_k4096_n4096_decode_v2_tg128, 128, 4, 4096, 4096)
-DECODE_Q4K_V2_TG(q4_k_k4096_n4096_decode_v2_tg256, 256, 8, 4096, 4096)
-DECODE_Q4K_V2_TG(q4_k_k12288_n4096_decode_v2_tg128, 128, 4, 12288, 4096)
-DECODE_Q4K_V2_TG(q4_k_k12288_n4096_decode_v2_tg256, 256, 8, 12288, 4096)
-DECODE_Q4K_V2_TG(q4_k_k4096_n8192_decode_v2_tg128, 128, 4, 4096, 8192)
-DECODE_Q4K_V2_TG(q4_k_k4096_n8192_decode_v2_tg256, 256, 8, 4096, 8192)
-DECODE_Q4K_V2_TG(q4_k_k4096_n12288_decode_v2_tg128, 128, 4, 4096, 12288)
-DECODE_Q4K_V2_TG(q4_k_k4096_n12288_decode_v2_tg256, 256, 8, 4096, 12288)
+DECODE_Q4K_V2_REG_TG(q4_k_k4096_n1024_decode_v2_tg256_reg, 256, 8, 4096, 1024)
+DECODE_Q4K_V2_REG_TG(q4_k_k4096_n4096_decode_v2_tg128_reg, 128, 4, 4096, 4096)
+DECODE_Q4K_V2_REG_TG(q4_k_k12288_n4096_decode_v2_tg128_reg, 128, 4, 12288, 4096)
+DECODE_Q4K_V2_REG_TG(q4_k_k4096_n8192_decode_v2_tg128_reg, 128, 4, 4096, 8192)
+DECODE_Q4K_V2_REG_TG(q4_k_k4096_n12288_decode_v2_tg128_reg, 128, 4, 4096, 12288)
 
 PREFILL_QK_V2_BN16(q5_k_k4096_n1024_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 1024)
 PREFILL_QK_V2_BN16(q5_k_k4096_n4096_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 4096)
