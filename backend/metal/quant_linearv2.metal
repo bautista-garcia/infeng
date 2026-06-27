@@ -115,7 +115,7 @@ kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]
                  uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) { \
     uint row = group.x * NSIMD + simd_group; \
     float acc = 0.0f; \
-    if (row < N) for (long kb = 0; kb < K / 256; ++kb) { \
+    for (long kb = 0; kb < K / 256; ++kb) { \
         long k0 = kb * 256, o = long(row) * (K / 256) * 144 + kb * 144; \
         float d = float(h16(w + o)), dm = float(h16(w + o + 2)); \
         half x0 = x[k0 + simd_lane], x1 = x[k0 + simd_lane + 32], x2 = x[k0 + simd_lane + 64], x3 = x[k0 + simd_lane + 96]; \
