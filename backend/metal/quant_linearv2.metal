@@ -108,7 +108,63 @@ kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]
     } \
 }
 
-#define DECODE_Q4K_V2_REG_TG(name, TG, NSIMD, K, N) \
+static inline void q4k_decode_block(thread float& acc, device const half* x, device const uchar* w,
+                                    uint k0, uint kb, uint row, uint simd_lane, uint K) {
+    long o = long(row) * (K / 256) * 144 + kb * 144;
+    float d = float(h16(w + o)), dm = float(h16(w + o + 2));
+    uchar sc, mn, q = w[o + 16 + simd_lane];
+    scale_min_k4(0, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane]), d * float(sc) * float(q & 15) - dm * float(mn), acc);
+    scale_min_k4(1, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 32]), d * float(sc) * float(q >> 4) - dm * float(mn), acc);
+    q = w[o + 48 + simd_lane];
+    scale_min_k4(2, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 64]), d * float(sc) * float(q & 15) - dm * float(mn), acc);
+    scale_min_k4(3, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 96]), d * float(sc) * float(q >> 4) - dm * float(mn), acc);
+    q = w[o + 80 + simd_lane];
+    scale_min_k4(4, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 128]), d * float(sc) * float(q & 15) - dm * float(mn), acc);
+    scale_min_k4(5, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 160]), d * float(sc) * float(q >> 4) - dm * float(mn), acc);
+    q = w[o + 112 + simd_lane];
+    scale_min_k4(6, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 192]), d * float(sc) * float(q & 15) - dm * float(mn), acc);
+    scale_min_k4(7, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 224]), d * float(sc) * float(q >> 4) - dm * float(mn), acc);
+}
+
+static inline void q5k_decode_block(thread float& acc, device const half* x, device const uchar* w,
+                                    uint k0, uint kb, uint row, uint simd_lane, uint K) {
+    long o = long(row) * (K / 256) * 176 + kb * 176;
+    float d = float(h16(w + o)), dm = float(h16(w + o + 2));
+    uchar hm = w[o + 16 + simd_lane];
+    for (uint t = 0; t < 4; ++t) {
+        uchar sc, mn, q = w[o + 48 + t * 32 + simd_lane];
+        uint r = t * 64 + simd_lane, j = t * 2;
+        scale_min_k4(j, w + o + 4, sc, mn);
+        acc = fma(float(x[k0 + r]), d * float(sc) * float((q & 15) + ((hm & (1 << j)) ? 16 : 0)) - dm * float(mn), acc);
+        scale_min_k4(j + 1, w + o + 4, sc, mn);
+        acc = fma(float(x[k0 + r + 32]), d * float(sc) * float((q >> 4) + ((hm & (1 << (j + 1))) ? 16 : 0)) - dm * float(mn), acc);
+    }
+}
+
+static inline void q6k_decode_block(thread float& acc, device const half* x, device const uchar* w,
+                                    uint k0, uint kb, uint row, uint simd_lane, uint K) {
+    uint l = simd_lane;
+    long o = long(row) * (K / 256) * 210 + kb * 210;
+    float d = float(h16(w + o + 208));
+    for (uint h = 0; h < 2; ++h) for (uint p = 0; p < 4; ++p) {
+        uint rr = p * 32 + l, qlo = h * 64 + ((rr & 32) ? 32 : 0) + l, r = h * 128 + rr;
+        uchar q = w[o + qlo], lo = (rr & 64) ? (q >> 4) : (q & 15);
+        uchar hi = (w[o + 128 + h * 32 + l] >> (2 * p)) & 3;
+        char sc = char(w[o + 192 + h * 8 + (rr >> 4)]);
+        acc = fma(float(x[k0 + r]), d * float(sc) * (float((hi << 4) | lo) - 32.0f), acc);
+    }
+}
+
+static inline void q8_0_decode_block(thread float& acc, device const half* x, device const uchar* w,
+                                     uint k0, uint kb, uint row, uint simd_lane, uint K) {
+    long base = long(row) * (K / 32) * 34 + kb * 8 * 34;
+    for (uint t = 0; t < 8; ++t) {
+        long o = base + t * 34;
+        acc = fma(float(x[k0 + t * 32 + simd_lane]), float(h16(w + o)) * float(char(w[o + 2 + simd_lane])), acc);
+    }
+}
+
+#define DECODE_QK_V2_REG_TG(name, decode_block, TG, NSIMD, K, N) \
 [[max_total_threads_per_threadgroup(TG)]] \
 kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], \
                  device const uchar* w [[buffer(2)]], uint simd_lane [[thread_index_in_simdgroup]], \
@@ -116,23 +172,25 @@ kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]
     uint row = group.x * NSIMD + simd_group; \
     float acc = 0.0f; \
     for (uint kb = 0; kb < K / 256; ++kb) { \
-        uint k0 = kb * 256, o = row * (K / 256) * 144 + kb * 144; \
-        float d = float(h16(w + o)), dm = float(h16(w + o + 2)); \
-        uchar sc, mn, q = w[o + 16 + simd_lane]; \
-        scale_min_k4(0, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane]), d * float(sc) * float(q & 15) - dm * float(mn), acc); \
-        scale_min_k4(1, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 32]), d * float(sc) * float(q >> 4) - dm * float(mn), acc); \
-        q = w[o + 48 + simd_lane]; \
-        scale_min_k4(2, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 64]), d * float(sc) * float(q & 15) - dm * float(mn), acc); \
-        scale_min_k4(3, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 96]), d * float(sc) * float(q >> 4) - dm * float(mn), acc); \
-        q = w[o + 80 + simd_lane]; \
-        scale_min_k4(4, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 128]), d * float(sc) * float(q & 15) - dm * float(mn), acc); \
-        scale_min_k4(5, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 160]), d * float(sc) * float(q >> 4) - dm * float(mn), acc); \
-        q = w[o + 112 + simd_lane]; \
-        scale_min_k4(6, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 192]), d * float(sc) * float(q & 15) - dm * float(mn), acc); \
-        scale_min_k4(7, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 224]), d * float(sc) * float(q >> 4) - dm * float(mn), acc); \
+        uint k0 = kb * 256; \
+        decode_block(acc, x, w, k0, kb, row, simd_lane, K); \
     } \
     acc = simd_sum(acc); \
     if (row < N && simd_lane == 0) y[row] = half(acc); \
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void q4_k_embed(device half* y [[buffer(0)]], device const long* ids [[buffer(1)]],
+                       device const uchar* w [[buffer(2)]], constant long& T [[buffer(3)]],
+                       constant long& K [[buffer(4)]], uint3 lane3 [[thread_position_in_threadgroup]],
+                       uint3 group [[threadgroup_position_in_grid]]) {
+    uint col = group.x * 256 + lane3.x, t = group.y;
+    if (t >= T || col >= K) return;
+    long row = ids[t], nb = K / 256, o = row * nb * 144 + (col >> 8) * 144;
+    uint r = col & 255, j = r >> 5, qj = (r >> 6) * 32 + (r & 31);
+    uchar sc, mn; scale_min_k4(j, w + o + 4, sc, mn);
+    uchar q = w[o + 16 + qj], v = (r & 32) ? (q >> 4) : (q & 15);
+    y[t * K + col] = half(float(h16(w + o)) * float(sc) * float(v) - float(h16(w + o + 2)) * float(mn));
 }
 
 PREFILL_QK_V2_BN16(q4_k_k4096_n1024_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 1024)
@@ -141,11 +199,11 @@ PREFILL_QK_V2_BN16(q4_k_k12288_n4096_prefill_v2_bn16, Q4K_DEQUANT_TILE, 12288, 4
 PREFILL_QK_V2_BN16(q4_k_k4096_n8192_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 8192)
 PREFILL_QK_V2_BN16(q4_k_k4096_n12288_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 12288)
 
-DECODE_Q4K_V2_REG_TG(q4_k_k4096_n1024_decode_v2_tg256_reg, 256, 8, 4096, 1024)
-DECODE_Q4K_V2_REG_TG(q4_k_k4096_n4096_decode_v2_tg128_reg, 128, 4, 4096, 4096)
-DECODE_Q4K_V2_REG_TG(q4_k_k12288_n4096_decode_v2_tg128_reg, 128, 4, 12288, 4096)
-DECODE_Q4K_V2_REG_TG(q4_k_k4096_n8192_decode_v2_tg128_reg, 128, 4, 4096, 8192)
-DECODE_Q4K_V2_REG_TG(q4_k_k4096_n12288_decode_v2_tg128_reg, 128, 4, 4096, 12288)
+DECODE_QK_V2_REG_TG(q4_k_k4096_n1024_decode_v2_tg256_reg, q4k_decode_block, 256, 8, 4096, 1024)
+DECODE_QK_V2_REG_TG(q4_k_k4096_n4096_decode_v2_tg128_reg, q4k_decode_block, 128, 4, 4096, 4096)
+DECODE_QK_V2_REG_TG(q4_k_k12288_n4096_decode_v2_tg128_reg, q4k_decode_block, 128, 4, 12288, 4096)
+DECODE_QK_V2_REG_TG(q4_k_k4096_n8192_decode_v2_tg128_reg, q4k_decode_block, 128, 4, 4096, 8192)
+DECODE_QK_V2_REG_TG(q4_k_k4096_n12288_decode_v2_tg128_reg, q4k_decode_block, 128, 4, 4096, 12288)
 
 PREFILL_QK_V2_BN16(q5_k_k4096_n1024_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 1024)
 PREFILL_QK_V2_BN16(q5_k_k4096_n4096_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 4096)
@@ -153,8 +211,19 @@ PREFILL_QK_V2_BN16(q5_k_k12288_n4096_prefill_v2_bn16, Q5K_DEQUANT_TILE, 12288, 4
 PREFILL_QK_V2_BN16(q5_k_k4096_n8192_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 8192)
 PREFILL_QK_V2_BN16(q5_k_k4096_n12288_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 12288)
 
+DECODE_QK_V2_REG_TG(q5_k_k4096_n1024_decode_v2_tg256_reg, q5k_decode_block, 256, 8, 4096, 1024)
+DECODE_QK_V2_REG_TG(q5_k_k4096_n4096_decode_v2_tg128_reg, q5k_decode_block, 128, 4, 4096, 4096)
+DECODE_QK_V2_REG_TG(q5_k_k12288_n4096_decode_v2_tg128_reg, q5k_decode_block, 128, 4, 12288, 4096)
+DECODE_QK_V2_REG_TG(q5_k_k4096_n8192_decode_v2_tg128_reg, q5k_decode_block, 128, 4, 4096, 8192)
+DECODE_QK_V2_REG_TG(q5_k_k4096_n12288_decode_v2_tg128_reg, q5k_decode_block, 128, 4, 4096, 12288)
+
 PREFILL_QK_V2_BN16(q6_k_k4096_n1024_prefill_v2_bn16, Q6K_DEQUANT_TILE, 4096, 1024)
 PREFILL_QK_V2_BN16(q6_k_k12288_n4096_prefill_v2_bn16, Q6K_DEQUANT_TILE, 12288, 4096)
 PREFILL_QK_V2_BN16(q6_k_k4096_n248320_prefill_v2_bn16, Q6K_DEQUANT_TILE, 4096, 248320)
 
+DECODE_QK_V2_REG_TG(q6_k_k4096_n1024_decode_v2_tg256_reg, q6k_decode_block, 256, 8, 4096, 1024)
+DECODE_QK_V2_REG_TG(q6_k_k12288_n4096_decode_v2_tg128_reg, q6k_decode_block, 128, 4, 12288, 4096)
+DECODE_QK_V2_REG_TG(q6_k_k4096_n248320_decode_v2_tg128_reg, q6k_decode_block, 128, 4, 4096, 248320)
+
 PREFILL_QK_V2_BN16(q8_0_k4096_n4096_prefill_v2_bn16, Q8_0_DEQUANT_TILE, 4096, 4096)
+DECODE_QK_V2_REG_TG(q8_0_k4096_n4096_decode_v2_tg128_reg, q8_0_decode_block, 128, 4, 4096, 4096)

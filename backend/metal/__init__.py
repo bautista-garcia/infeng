@@ -74,26 +74,40 @@ class QuantLinearKernels:
         if k != weight.shape[1]:
             raise RuntimeError(f"quant linear expects x=(...,K), weight=(N,K); got {x.shape}, {weight.shape}")
         registry = {
-            ("Q4_K", 4096, 1024): (self.lib.q4_k_k4096_n1024_decode, self.v2.q4_k_k4096_n1024_prefill_v2_bn16, "v2"),
-            ("Q4_K", 4096, 4096): (self.lib.q4_k_k4096_n4096_decode, self.v2.q4_k_k4096_n4096_prefill_v2_bn16, "v2"),
-            ("Q4_K", 12288, 4096): (self.lib.q4_k_k12288_n4096_decode, self.v2.q4_k_k12288_n4096_prefill_v2_bn16, "v2"),
-            ("Q4_K", 4096, 8192): (self.lib.q4_k_k4096_n8192_decode, self.v2.q4_k_k4096_n8192_prefill_v2_bn16, "v2"),
-            ("Q4_K", 4096, 12288): (self.lib.q4_k_k4096_n12288_decode, self.v2.q4_k_k4096_n12288_prefill_v2_bn16, "v2"),
-            ("Q5_K", 4096, 1024): (self.lib.q5_k_k4096_n1024_decode, self.v2.q5_k_k4096_n1024_prefill_v2_bn16, "v2"),
-            ("Q5_K", 4096, 4096): (self.lib.q5_k_k4096_n4096_decode, self.v2.q5_k_k4096_n4096_prefill_v2_bn16, "v2"),
-            ("Q5_K", 12288, 4096): (self.lib.q5_k_k12288_n4096_decode, self.v2.q5_k_k12288_n4096_prefill_v2_bn16, "v2"),
-            ("Q5_K", 4096, 8192): (self.lib.q5_k_k4096_n8192_decode, self.v2.q5_k_k4096_n8192_prefill_v2_bn16, "v2"),
-            ("Q5_K", 4096, 12288): (self.lib.q5_k_k4096_n12288_decode, self.v2.q5_k_k4096_n12288_prefill_v2_bn16, "v2"),
-            ("Q6_K", 4096, 1024): (self.lib.q6_k_k4096_n1024_decode, self.v2.q6_k_k4096_n1024_prefill_v2_bn16, "v2"),
-            ("Q6_K", 12288, 4096): (self.lib.q6_k_k12288_n4096_decode, self.v2.q6_k_k12288_n4096_prefill_v2_bn16, "v2"),
-            ("Q6_K", 4096, 248320): (self.lib.q6_k_k4096_n248320_decode, self.v2.q6_k_k4096_n248320_prefill_v2_bn16, "v2"),
-            ("Q8_0", 4096, 4096): (self.lib.q8_0_k4096_n4096_decode, self.v2.q8_0_k4096_n4096_prefill_v2_bn16, "v2"),
+            ("Q4_K", 4096, 1024): (self.v2.q4_k_k4096_n1024_decode_v2_tg256_reg,
+                                    self.v2.q4_k_k4096_n1024_prefill_v2_bn16, "v2", 256, 8),
+            ("Q4_K", 4096, 4096): (self.v2.q4_k_k4096_n4096_decode_v2_tg128_reg,
+                                    self.v2.q4_k_k4096_n4096_prefill_v2_bn16, "v2", 128, 4),
+            ("Q4_K", 12288, 4096): (self.v2.q4_k_k12288_n4096_decode_v2_tg128_reg,
+                                     self.v2.q4_k_k12288_n4096_prefill_v2_bn16, "v2", 128, 4),
+            ("Q4_K", 4096, 8192): (self.v2.q4_k_k4096_n8192_decode_v2_tg128_reg,
+                                    self.v2.q4_k_k4096_n8192_prefill_v2_bn16, "v2", 128, 4),
+            ("Q4_K", 4096, 12288): (self.v2.q4_k_k4096_n12288_decode_v2_tg128_reg,
+                                     self.v2.q4_k_k4096_n12288_prefill_v2_bn16, "v2", 128, 4),
+            ("Q5_K", 4096, 1024): (self.v2.q5_k_k4096_n1024_decode_v2_tg256_reg,
+                                    self.v2.q5_k_k4096_n1024_prefill_v2_bn16, "v2", 256, 8),
+            ("Q5_K", 4096, 4096): (self.v2.q5_k_k4096_n4096_decode_v2_tg128_reg,
+                                    self.v2.q5_k_k4096_n4096_prefill_v2_bn16, "v2", 128, 4),
+            ("Q5_K", 12288, 4096): (self.v2.q5_k_k12288_n4096_decode_v2_tg128_reg,
+                                     self.v2.q5_k_k12288_n4096_prefill_v2_bn16, "v2", 128, 4),
+            ("Q5_K", 4096, 8192): (self.v2.q5_k_k4096_n8192_decode_v2_tg128_reg,
+                                    self.v2.q5_k_k4096_n8192_prefill_v2_bn16, "v2", 128, 4),
+            ("Q5_K", 4096, 12288): (self.v2.q5_k_k4096_n12288_decode_v2_tg128_reg,
+                                     self.v2.q5_k_k4096_n12288_prefill_v2_bn16, "v2", 128, 4),
+            ("Q6_K", 4096, 1024): (self.v2.q6_k_k4096_n1024_decode_v2_tg256_reg,
+                                    self.v2.q6_k_k4096_n1024_prefill_v2_bn16, "v2", 256, 8),
+            ("Q6_K", 12288, 4096): (self.v2.q6_k_k12288_n4096_decode_v2_tg128_reg,
+                                     self.v2.q6_k_k12288_n4096_prefill_v2_bn16, "v2", 128, 4),
+            ("Q6_K", 4096, 248320): (self.v2.q6_k_k4096_n248320_decode_v2_tg128_reg,
+                                      self.v2.q6_k_k4096_n248320_prefill_v2_bn16, "v2", 128, 4),
+            ("Q8_0", 4096, 4096): (self.v2.q8_0_k4096_n4096_decode_v2_tg128_reg,
+                                    self.v2.q8_0_k4096_n4096_prefill_v2_bn16, "v2", 128, 4),
             ("IQ4_XS", 4096, 12288): (self.lib.iq4_xs_k4096_n12288_decode,
-                                       self.lib.iq4_xs_k4096_n12288_prefill, "scalar"),
+                                       self.lib.iq4_xs_k4096_n12288_prefill, "scalar", 32, 4),
         }
         if (weight.type_name, k, n) not in registry:
             raise RuntimeError(f"unsupported quant linear specialization {(weight.type_name, k, n)}")
-        decode, prefill, kind = registry[(weight.type_name, k, n)]
+        decode, prefill, kind, decode_tg, decode_rows = registry[(weight.type_name, k, n)]
         if kind == "v2" and m != 1:
             x2, mpad = x.reshape(m, k), (m + 31) // 32 * 32
             x2 = x2 if mpad == m else torch.nn.functional.pad(x2, (0, 0, 0, mpad - m))
@@ -103,7 +117,12 @@ class QuantLinearKernels:
 
         y = torch.empty((*x.shape[:-1], n), dtype=x.dtype, device=x.device)
         if m == 1:
-            decode(y, x, weight.data, threads=[32, (n + 3) // 4, 1], group_size=[32, 1, 1])
+            if kind == "v2":
+                threadgroups = (n + decode_rows - 1) // decode_rows
+                decode(y, x, weight.data, threads=[threadgroups * decode_tg, 1, 1],
+                       group_size=[decode_tg, 1, 1])
+            else:
+                decode(y, x, weight.data, threads=[32, (n + 3) // 4, 1], group_size=[32, 1, 1])
         else:
             threads = [32, (n + 3) // 4, m]
             prefill(y, x, weight.data, m, threads=threads, group_size=[threads[0], 1, 1])
@@ -112,8 +131,8 @@ class QuantLinearKernels:
     def embed_q4(self, ids: torch.Tensor, weight: Any, dtype: torch.dtype) -> torch.Tensor:
         y = torch.empty((*ids.shape, weight.shape[1]), dtype=dtype, device=ids.device)
         tokens, k = ids.numel(), weight.shape[1]
-        self.lib.q4_k_embed(y, ids, weight.data, tokens, k,
-                            threads=[((k + 255) // 256) * 256, tokens, 1], group_size=[256, 1, 1])
+        self.v2.q4_k_embed(y, ids, weight.data, tokens, k,
+                           threads=[((k + 255) // 256) * 256, tokens, 1], group_size=[256, 1, 1])
         return y
 
 
