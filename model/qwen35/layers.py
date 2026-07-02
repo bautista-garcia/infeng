@@ -341,8 +341,9 @@ class GatedDeltaNet(nn.Module):
         # Grouped Query Attention (GQA) 
         if self.num_v_heads != self.num_k_heads:
             repeat = self.num_v_heads // self.num_k_heads
-            query = query.repeat_interleave(repeat, dim=2)
-            key = key.repeat_interleave(repeat, dim=2)
+            # llama.cpp expands Qwen3.5 Gated DeltaNet key heads by tiling the head axis.
+            query = query.repeat(1, 1, repeat, 1)
+            key = key.repeat(1, 1, repeat, 1)
 
         initial_state = None if cache is None else cache.recurrent_state
         output, recurrent_state = self._recurrent_delta_rule(query, key, value, g, beta, initial_state)
