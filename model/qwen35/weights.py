@@ -13,6 +13,8 @@ import torch
 GGUF_TYPE_NAMES = {0: "F32", 1: "F16", 8: "Q8_0", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 23: "IQ4_XS", 30: "BF16"}
 GGUF_NATIVE_DTYPES = {0: torch.float32, 1: torch.float16, 30: torch.bfloat16}
 GGUF_BLOCK = {"Q8_0": (32, 34), "Q4_K": (256, 144), "Q5_K": (256, 176), "Q6_K": (256, 210), "IQ4_XS": (256, 136)}
+GGUF_VALUE_FORMATS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?",
+                      10: "<Q", 11: "<q", 12: "<d"}
 GGUF_TARGETS = {"token_embd.weight": "model.embed_tokens.weight", "output.weight": "lm_head.weight",
                 "output_norm.weight": "model.norm.weight", "model.output_norm.weight": "model.norm.weight"}
 GGUF_BLOCK_TARGETS = {
@@ -27,6 +29,7 @@ GGUF_BLOCK_TARGETS = {
     "ssm_conv1d.weight": "linear_attn.conv1d_weight", "ssm_out.weight": "linear_attn.out_proj.weight",
     "ssm_norm.weight": "linear_attn.norm.weight", "ssm_dt.bias": "linear_attn.dt_bias", "ssm_a": "linear_attn.A_log",
 }
+GGUF_TRANSFORMS = {"linear_attn.conv1d_weight": "conv1d", "linear_attn.A_log": "neg_log"}
 
 
 def _string(f) -> str:
@@ -35,16 +38,10 @@ def _string(f) -> str:
 
 
 def _value(f, typ: int):
-    if typ in (0, 1):
-        return struct.unpack("<B" if typ == 0 else "<b", f.read(1))[0]
-    if typ in (2, 3):
-        return struct.unpack("<H" if typ == 2 else "<h", f.read(2))[0]
-    if typ in (4, 5, 6, 7):
-        return struct.unpack(("<I", "<i", "<f", "<?")[typ - 4], f.read(4 if typ != 7 else 1))[0]
+    if fmt := GGUF_VALUE_FORMATS.get(typ):
+        return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
     if typ == 8:
         return _string(f)
-    if typ in (10, 11, 12):
-        return struct.unpack(("<Q", "<q", "<d")[typ - 10], f.read(8))[0]
     if typ == 9:
         item_type, size = struct.unpack("<IQ", f.read(12))
         return [_value(f, item_type) for _ in range(size)]
@@ -52,16 +49,10 @@ def _value(f, typ: int):
 
 
 def _skip_value(f, typ: int):
-    if typ in (0, 1, 7):
-        f.seek(1, 1)
-    elif typ in (2, 3):
-        f.seek(2, 1)
-    elif typ in (4, 5, 6):
-        f.seek(4, 1)
+    if fmt := GGUF_VALUE_FORMATS.get(typ):
+        f.seek(struct.calcsize(fmt), 1)
     elif typ == 8:
         f.seek(struct.unpack("<Q", f.read(8))[0], 1)
-    elif typ in (10, 11, 12):
-        f.seek(8, 1)
     elif typ == 9:
         item_type, size = struct.unpack("<IQ", f.read(12))
         for _ in range(size):
@@ -148,7 +139,7 @@ def _target(key: str) -> tuple[str, str | None] | None:
     if len(parts) < 3 or parts[0] != "blk":
         return None
     attr = GGUF_BLOCK_TARGETS.get(".".join(parts[2:]))
-    return (f"model.layers.{parts[1]}.{attr}", "conv1d" if attr == "linear_attn.conv1d_weight" else "neg_log" if attr == "linear_attn.A_log" else None) if attr else None
+    return (f"model.layers.{parts[1]}.{attr}", GGUF_TRANSFORMS.get(attr)) if attr else None
 
 
 def _set(root: torch.nn.Module, dotted: str, value: QuantWeight):
@@ -192,4 +183,3 @@ def load_weights(model: torch.nn.Module, path: str | Path) -> None:
         _set(model, target_key, QuantWeight(source_key, shape, typ, data,
                                             data_start + offset, nbytes, block_size, block_bytes, transform))
     print(f"GGUF weights loaded in {time.perf_counter() - load_t0:.3f}s")
-

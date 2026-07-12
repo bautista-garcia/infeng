@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 
 from model.qwen35.model import ForCausalLM
 from model.qwen35.weights import load_weights
+from .memory import Memory, RequestMemory
 
 
 class InferenceEngine:
@@ -16,6 +17,7 @@ class InferenceEngine:
         self.model = ForCausalLM(weights).eval()
         load_weights(self.model, weights)
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+        self.memory = Memory(self.model.config)
         self.paged_attention = self.prefix_cache = None
 
     def _sample(self, logits: torch.Tensor, temperature: float = 0.0, top_p: float = 1.0,
@@ -32,6 +34,17 @@ class InferenceEngine:
             logits = logits.scatter(1, sorted_idx, sorted_logits.masked_fill(remove, -torch.inf))
         return torch.multinomial(F.softmax(logits, dim=-1), 1)
 
+    def _run(self, input_ids: torch.Tensor, memory: RequestMemory, decode: bool) -> tuple[torch.Tensor, RequestMemory]:
+        return (self.model.decode if decode else self.model.prefill)(
+            input_ids, memory.position_ids(input_ids), memory), memory
+
+    def prefill(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, RequestMemory]:
+        memory = self.memory.new_request()
+        return self._run(input_ids, memory, False)
+
+    def decode(self, input_ids: torch.Tensor, memory: RequestMemory) -> tuple[torch.Tensor, RequestMemory]:
+        return self._run(input_ids, memory, True)
+
     @torch.no_grad()
     def generate(self, messages: list[dict] | str, max_new_tokens: int | None = None, thinking: bool = False,
                  stop_token_ids: list[int] | None = None, temperature: float = 0.0, top_p: float = 1.0,
@@ -47,12 +60,12 @@ class InferenceEngine:
             stop_token_ids = [t for t in (self.tokenizer.eos_token_id, im_end) if t is not None]
         max_position = self.model.config.get("max_position_embeddings", 4096)
         max_new_tokens = max_position - tokens.shape[1] if max_new_tokens is None else max_new_tokens
-        cache, input_ids = None, tokens
-        for _ in range(max_new_tokens):
-            logits, cache = self.model(input_ids, cache=cache, use_cache=True)
+        logits, memory = self.prefill(tokens)
+        for i in range(max_new_tokens):
             next_token = self._sample(logits[:, -1], temperature, top_p, top_k)
-            input_ids = next_token
             token_id = next_token.item()
             if token_id in stop_token_ids:
                 break
             yield token_id
+            if i + 1 < max_new_tokens:
+                logits, memory = self.decode(next_token, memory)

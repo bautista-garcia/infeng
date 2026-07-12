@@ -9,60 +9,56 @@ import torch
 
 _DELTA_RULE_KERNELS: "DeltaRuleKernels | None" = None
 _QUANT_LINEAR_KERNELS: "QuantLinearKernels | None" = None
+_FUSED_LAYER_KERNELS: "FusedLayerKernels | None" = None
 # The 32-token Metal prefill solve can become unstable on real Qwen3.5 activations.
 _DELTA_PREFILL_CHUNK = 16
+QUANT_LINEAR_SPECS = {spec: ((256, 8) if spec[2] == 1024 else (128, 4)) for spec in (
+    *[(q, 4096, n) for q in ("Q4_K", "Q5_K") for n in (1024, 4096, 8192, 12288)],
+    ("Q4_K", 12288, 4096), ("Q5_K", 12288, 4096), ("Q6_K", 4096, 1024),
+    ("Q6_K", 12288, 4096), ("Q6_K", 4096, 248320), ("Q8_0", 4096, 4096),
+    ("IQ4_XS", 4096, 12288))}
+
+
+def _compile(name: str):
+    return torch.mps.compile_shader(Path(__file__).with_name(name).read_text())
 
 
 @dataclass
 class DeltaRuleKernels:
     lib: object
 
-    def __call__(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor,
-                 beta: torch.Tensor, initial_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-        if query.device.type != "mps" or key.device.type != "mps" or value.device.type != "mps":
-            raise RuntimeError("Metal delta rule requires query/key/value on mps")
-        if query.dtype != torch.float16 or key.dtype != torch.float16 or value.dtype != torch.float16 or beta.dtype != torch.float16:
-            raise RuntimeError("Metal delta rule requires fp16 query/key/value/beta")
-        if g.dtype != torch.float32:
-            raise RuntimeError("Metal delta rule requires fp32 g")
-        if query.shape != key.shape or query.ndim != 4 or value.ndim != 4 or g.ndim != 3 or beta.ndim != 3:
-            raise RuntimeError(f"Metal delta rule expects q/k/v=(B,L,H,D), g/beta=(B,L,H); got {query.shape}, {key.shape}, {value.shape}, {g.shape}, {beta.shape}")
+    def prefill(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor,
+                beta: torch.Tensor, initial_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, num_heads, _ = query.shape
+        output = torch.empty_like(value, memory_format=torch.contiguous_format)
+        state = initial_state if initial_state is not None else torch.empty((batch_size, num_heads, 128, 128),
+                                                                            dtype=torch.float32, device=query.device)
+        for start in range(0, seq_len, _DELTA_PREFILL_CHUNK):
+            end = min(start + _DELTA_PREFILL_CHUNK, seq_len)
+            q, k, v, gg, bb = (x[:, start:end].contiguous() for x in (query, key, value, g, beta))
+            out = torch.empty_like(v, memory_format=torch.contiguous_format)
+            chunk_args = (out, state, q, k, v, gg, bb, batch_size, end - start, num_heads, v.stride(0),
+                          v.stride(1), v.stride(2), v.stride(3), initial_state is not None or start > 0)
+            self.lib.delta_rule_prefill(*chunk_args, threads=[128, batch_size * num_heads, 1], group_size=[128, 1, 1])
+            output[:, start:end].copy_(out)
+        return output, state
 
-        batch_size, seq_len, num_heads, key_dim = query.shape
-        if value.shape != (batch_size, seq_len, num_heads, 128) or g.shape != (batch_size, seq_len, num_heads) or beta.shape != g.shape:
-            raise RuntimeError(f"Metal delta rule expects matching Qwen3.5 value/g/beta shapes, got value={value.shape}, g={g.shape}, beta={beta.shape}")
-        if (num_heads, key_dim) != (32, 128):
-            raise RuntimeError(f"Metal delta rule only supports H=32, Dk=Dv=128, got H={num_heads}, Dk={key_dim}")
-        if not query.is_contiguous() or not key.is_contiguous() or not g.is_contiguous() or not beta.is_contiguous():
-            raise RuntimeError("Metal delta rule expects contiguous query/key/g/beta")
-        if initial_state is not None and (initial_state.device.type != "mps" or initial_state.dtype != torch.float32 or initial_state.shape != (batch_size, num_heads, 128, 128)):
-            raise RuntimeError(f"Metal delta rule initial_state must be fp32 mps with shape {(batch_size, num_heads, 128, 128)}")
-
+    def decode(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor,
+               beta: torch.Tensor, initial_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, num_heads, _ = query.shape
         output = torch.empty_like(value, memory_format=torch.contiguous_format)
         state = initial_state if initial_state is not None else torch.empty((batch_size, num_heads, 128, 128),
                                                                             dtype=torch.float32, device=query.device)
         args = (output, state, query, key, value, g, beta, batch_size, seq_len, num_heads, value.stride(0),
                 value.stride(1), value.stride(2), value.stride(3), initial_state is not None)
-        if seq_len == 1:
-            self.lib.delta_rule_decode(*args, threads=[batch_size * num_heads * 512, 1, 1], group_size=[512, 1, 1])
-        else:
-            for start in range(0, seq_len, _DELTA_PREFILL_CHUNK):
-                end = min(start + _DELTA_PREFILL_CHUNK, seq_len)
-                q, k, v, gg, bb = (x[:, start:end].contiguous() for x in (query, key, value, g, beta))
-                out = torch.empty_like(v, memory_format=torch.contiguous_format)
-                chunk_args = (out, state, q, k, v, gg, bb, batch_size, end - start, num_heads, v.stride(0),
-                              v.stride(1), v.stride(2), v.stride(3), initial_state is not None or start > 0)
-                self.lib.delta_rule_prefill(*chunk_args, threads=[128, batch_size * num_heads, 1],
-                                            group_size=[128, 1, 1])
-                output[:, start:end].copy_(out)
+        self.lib.delta_rule_decode(*args, threads=[batch_size * num_heads * 512, 1, 1], group_size=[512, 1, 1])
         return output, state
 
 
 def get_delta_rule_kernels() -> DeltaRuleKernels:
     global _DELTA_RULE_KERNELS
     if _DELTA_RULE_KERNELS is None:
-        source = (Path(__file__).with_name("delta_rule.metal")).read_text()
-        _DELTA_RULE_KERNELS = DeltaRuleKernels(torch.mps.compile_shader(source))
+        _DELTA_RULE_KERNELS = DeltaRuleKernels(_compile("delta_rule.metal"))
     return _DELTA_RULE_KERNELS
 
 
@@ -70,52 +66,27 @@ def get_delta_rule_kernels() -> DeltaRuleKernels:
 class QuantLinearKernels:
     lib: object
 
-    def __call__(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
-        m, k, n = x.numel() // x.shape[-1], x.shape[-1], weight.shape[0]
-        if k != weight.shape[1]:
-            raise RuntimeError(f"quant linear expects x=(...,K), weight=(N,K); got {x.shape}, {weight.shape}")
-        registry = {
-            ("Q4_K", 4096, 1024): (self.lib.q4_k_k4096_n1024_decode_v2_tg256_reg,
-                                    self.lib.q4_k_k4096_n1024_prefill_v2_bn16, 256, 8),
-            ("Q4_K", 4096, 4096): (self.lib.q4_k_k4096_n4096_decode_v2_tg128_reg,
-                                    self.lib.q4_k_k4096_n4096_prefill_v2_bn16, 128, 4),
-            ("Q4_K", 12288, 4096): (self.lib.q4_k_k12288_n4096_decode_v2_tg128_reg,
-                                     self.lib.q4_k_k12288_n4096_prefill_v2_bn16, 128, 4),
-            ("Q4_K", 4096, 8192): (self.lib.q4_k_k4096_n8192_decode_v2_tg128_reg,
-                                    self.lib.q4_k_k4096_n8192_prefill_v2_bn16, 128, 4),
-            ("Q4_K", 4096, 12288): (self.lib.q4_k_k4096_n12288_decode_v2_tg128_reg,
-                                     self.lib.q4_k_k4096_n12288_prefill_v2_bn16, 128, 4),
-            ("Q5_K", 4096, 1024): (self.lib.q5_k_k4096_n1024_decode_v2_tg256_reg,
-                                    self.lib.q5_k_k4096_n1024_prefill_v2_bn16, 256, 8),
-            ("Q5_K", 4096, 4096): (self.lib.q5_k_k4096_n4096_decode_v2_tg128_reg,
-                                    self.lib.q5_k_k4096_n4096_prefill_v2_bn16, 128, 4),
-            ("Q5_K", 12288, 4096): (self.lib.q5_k_k12288_n4096_decode_v2_tg128_reg,
-                                     self.lib.q5_k_k12288_n4096_prefill_v2_bn16, 128, 4),
-            ("Q5_K", 4096, 8192): (self.lib.q5_k_k4096_n8192_decode_v2_tg128_reg,
-                                    self.lib.q5_k_k4096_n8192_prefill_v2_bn16, 128, 4),
-            ("Q5_K", 4096, 12288): (self.lib.q5_k_k4096_n12288_decode_v2_tg128_reg,
-                                     self.lib.q5_k_k4096_n12288_prefill_v2_bn16, 128, 4),
-            ("Q6_K", 4096, 1024): (self.lib.q6_k_k4096_n1024_decode_v2_tg256_reg,
-                                    self.lib.q6_k_k4096_n1024_prefill_v2_bn16, 256, 8),
-            ("Q6_K", 12288, 4096): (self.lib.q6_k_k12288_n4096_decode_v2_tg128_reg,
-                                     self.lib.q6_k_k12288_n4096_prefill_v2_bn16, 128, 4),
-            ("Q6_K", 4096, 248320): (self.lib.q6_k_k4096_n248320_decode_v2_tg128_reg,
-                                      self.lib.q6_k_k4096_n248320_prefill_v2_bn16, 128, 4),
-            ("Q8_0", 4096, 4096): (self.lib.q8_0_k4096_n4096_decode_v2_tg128_reg,
-                                    self.lib.q8_0_k4096_n4096_prefill_v2_bn16, 128, 4),
-            ("IQ4_XS", 4096, 12288): (self.lib.iq4_xs_k4096_n12288_decode,
-                                       self.lib.iq4_xs_k4096_n12288_prefill, 128, 4),
-        }
-        if (weight.type_name, k, n) not in registry:
-            raise RuntimeError(f"unsupported quant linear specialization {(weight.type_name, k, n)}")
-        decode, prefill, decode_tg, decode_rows = registry[(weight.type_name, k, n)]
-        if m != 1:
-            x2, mpad = x.reshape(m, k), (m + 31) // 32 * 32
-            x2 = x2 if mpad == m else torch.nn.functional.pad(x2, (0, 0, 0, mpad - m))
-            y2 = torch.empty((mpad, n), dtype=x.dtype, device=x.device)
-            prefill(y2, x2, weight.data, mpad, threads=[128 * (n // 16), mpad // 32, 1], group_size=[128, 1, 1])
-            return y2[:m].reshape(*x.shape[:-1], n)
+    def _spec(self, x: torch.Tensor, weight: Any):
+        k, n = x.shape[-1], weight.shape[0]
+        decode_tg, decode_rows = QUANT_LINEAR_SPECS[(weight.type_name, k, n)]
+        base = f"{weight.type_name.lower()}_k{k}_n{n}"
+        if weight.type_name == "IQ4_XS":
+            return (getattr(self.lib, base + "_decode"), getattr(self.lib, base + "_prefill"),
+                    decode_tg, decode_rows), k, n
+        return (getattr(self.lib, f"{base}_decode_v2_tg{decode_tg}_reg"),
+                getattr(self.lib, base + "_prefill_v2_bn16"), decode_tg, decode_rows), k, n
 
+    def prefill(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
+        (_, prefill, _, _), k, n = self._spec(x, weight)
+        m, x2 = x.numel() // k, x.reshape(x.numel() // k, k)
+        mpad = (m + 31) // 32 * 32
+        x2 = x2 if mpad == m else torch.nn.functional.pad(x2, (0, 0, 0, mpad - m))
+        y2 = torch.empty((mpad, n), dtype=x.dtype, device=x.device)
+        prefill(y2, x2, weight.data, mpad, threads=[128 * (n // 16), mpad // 32, 1], group_size=[128, 1, 1])
+        return y2[:m].reshape(*x.shape[:-1], n)
+
+    def decode(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
+        (decode, _, decode_tg, decode_rows), k, n = self._spec(x, weight)
         y = torch.empty((*x.shape[:-1], n), dtype=x.dtype, device=x.device)
         threadgroups = (n + decode_rows - 1) // decode_rows
         decode(y, x, weight.data, threads=[threadgroups * decode_tg, 1, 1], group_size=[decode_tg, 1, 1])
@@ -128,10 +99,46 @@ class QuantLinearKernels:
                             threads=[((k + 255) // 256) * 256, tokens, 1], group_size=[256, 1, 1])
         return y
 
+    def gdn_in_proj_decode(self, x: torch.Tensor, w_qkv: Any, w_z: Any, w_b: Any, w_a: Any) -> tuple[torch.Tensor, ...]:
+        lead = x.shape[:-1]
+        yq = torch.empty((*lead, 8192), dtype=x.dtype, device=x.device)
+        yz = torch.empty((*lead, 4096), dtype=x.dtype, device=x.device)
+        yb = torch.empty((*lead, 32), dtype=x.dtype, device=x.device)
+        ya = torch.empty_like(yb)
+        self.lib.gdn_in_proj_decode(yq, yz, yb, ya, x, w_qkv.data, w_z.data, w_b.data, w_a.data,
+                                    threads=[((12352 + 3) // 4) * 128, 1, 1], group_size=[128, 1, 1])
+        return yq, yz, yb, ya
+
 
 def get_quant_linear_kernels() -> QuantLinearKernels:
     global _QUANT_LINEAR_KERNELS
     if _QUANT_LINEAR_KERNELS is None:
-        source = (Path(__file__).with_name("quant_linear.metal")).read_text()
-        _QUANT_LINEAR_KERNELS = QuantLinearKernels(torch.mps.compile_shader(source))
+        _QUANT_LINEAR_KERNELS = QuantLinearKernels(_compile("quant_linear.metal"))
     return _QUANT_LINEAR_KERNELS
+
+
+@dataclass
+class FusedLayerKernels:
+    lib: object
+
+    def causal_conv_silu(self, x: torch.Tensor, weight: torch.Tensor,
+                         prev_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        b, seq_len, _ = x.shape
+        has_prev = prev_state is not None
+        prev = prev_state if has_prev else torch.empty((b, 8192, 4), dtype=x.dtype, device=x.device)
+        y, state = torch.empty_like(x), torch.empty((b, 8192, 4), dtype=x.dtype, device=x.device)
+        self.lib.gdn_causal_conv_silu(y, state, x, weight, prev, b, seq_len, has_prev,
+                                      threads=[b * 8192 * max(seq_len, 4), 1, 1], group_size=[256, 1, 1])
+        return y, state
+
+    def rmsnorm_gated(self, x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        y, rows = torch.empty_like(x), x.numel() // 128
+        self.lib.rmsnorm_gated_128(y, x, gate, weight, float(eps), threads=[128, rows, 1], group_size=[128, 1, 1])
+        return y
+
+
+def get_fused_layer_kernels() -> FusedLayerKernels:
+    global _FUSED_LAYER_KERNELS
+    if _FUSED_LAYER_KERNELS is None:
+        _FUSED_LAYER_KERNELS = FusedLayerKernels(_compile("fused_layers.metal"))
+    return _FUSED_LAYER_KERNELS

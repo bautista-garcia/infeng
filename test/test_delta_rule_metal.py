@@ -13,38 +13,24 @@ from backend.metal import get_delta_rule_kernels
 
 
 pytestmark = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is required")
-
-
-def _prefill(kernels, q, k, v, g, beta, initial_state):
-    batch_size, seq_len, num_heads, _ = q.shape
-    output = torch.empty_like(v, memory_format=torch.contiguous_format)
-    state = initial_state if initial_state is not None else torch.empty((batch_size, num_heads, 128, 128),
-                                                                        dtype=torch.float32, device=q.device)
-    for start in range(0, seq_len, 32):
-        end = min(start + 32, seq_len)
-        qq, kk, vv, gg, bb = (x[:, start:end].contiguous() for x in (q, k, v, g, beta))
-        out = torch.empty_like(vv, memory_format=torch.contiguous_format)
-        args = (out, state, qq, kk, vv, gg, bb, batch_size, end - start, num_heads, vv.stride(0), vv.stride(1),
-                vv.stride(2), vv.stride(3), initial_state is not None or start > 0)
-        kernels.lib.delta_rule_prefill(*args, threads=[128, batch_size * num_heads, 1], group_size=[128, 1, 1])
-        output[:, start:end].copy_(out)
-    return output, state
+DELTA_CASES = [(seq_len, 1, has_initial) for seq_len in (1, 8, 63, 64, 65, 128) for has_initial in (False, True)]
+DELTA_CASES += [(8, 2, False), (65, 2, False)]
 
 
 def _decode_tokens(kernels, q, k, v, g, beta, initial_state):
     outs, state = [], initial_state
     for t in range(q.shape[1]):
-        out, state = kernels(q[:, t:t + 1].contiguous(), k[:, t:t + 1].contiguous(), v[:, t:t + 1].contiguous(),
-                             g[:, t:t + 1].contiguous(), beta[:, t:t + 1].contiguous(), state)
+        out, state = kernels.decode(q[:, t:t + 1].contiguous(), k[:, t:t + 1].contiguous(),
+                                    v[:, t:t + 1].contiguous(), g[:, t:t + 1].contiguous(),
+                                    beta[:, t:t + 1].contiguous(), state)
         outs.append(out)
     return torch.cat(outs, dim=1), state
 
 
-@pytest.mark.parametrize("seq_len", [1, 8, 63, 64, 65, 128])
-@pytest.mark.parametrize("has_initial_state", [False, True])
-def test_delta_rule_prefill_matches_decode(seq_len: int, has_initial_state: bool):
-    torch.manual_seed(1000 + seq_len + has_initial_state)
-    batch_size, num_heads, dim = 1, 32, 128
+@pytest.mark.parametrize("seq_len,batch_size,has_initial_state", DELTA_CASES)
+def test_delta_rule_prefill_matches_decode(seq_len: int, batch_size: int, has_initial_state: bool):
+    torch.manual_seed(1000 + seq_len + 100 * batch_size + has_initial_state)
+    num_heads, dim = 32, 128
     q = torch.randn(batch_size, seq_len, num_heads, dim, device="mps", dtype=torch.float16).contiguous()
     k = torch.randn_like(q)
     v = torch.randn_like(q)
@@ -53,25 +39,8 @@ def test_delta_rule_prefill_matches_decode(seq_len: int, has_initial_state: bool
     initial = torch.randn(batch_size, num_heads, dim, dim, device="mps",
                           dtype=torch.float32) if has_initial_state else None
     kernels = get_delta_rule_kernels()
-    prefill_out, prefill_state = _prefill(kernels, q, k, v, g, beta, None if initial is None else initial.clone())
+    prefill_out, prefill_state = kernels.prefill(q, k, v, g, beta, None if initial is None else initial.clone())
     decode_out, decode_state = _decode_tokens(kernels, q, k, v, g, beta, None if initial is None else initial.clone())
-    torch.mps.synchronize()
-    torch.testing.assert_close(prefill_out.cpu(), decode_out.cpu(), atol=5e-3, rtol=5e-3)
-    torch.testing.assert_close(prefill_state.cpu(), decode_state.cpu(), atol=5e-3, rtol=5e-3)
-
-
-@pytest.mark.parametrize("seq_len", [8, 65])
-def test_delta_rule_prefill_matches_decode_batch_two(seq_len: int):
-    torch.manual_seed(2000 + seq_len)
-    batch_size, num_heads, dim = 2, 32, 128
-    q = torch.randn(batch_size, seq_len, num_heads, dim, device="mps", dtype=torch.float16).contiguous()
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    g = (torch.randn(batch_size, seq_len, num_heads, device="mps", dtype=torch.float32) * -0.01).contiguous()
-    beta = torch.rand(batch_size, seq_len, num_heads, device="mps", dtype=torch.float16).contiguous()
-    kernels = get_delta_rule_kernels()
-    prefill_out, prefill_state = _prefill(kernels, q, k, v, g, beta, None)
-    decode_out, decode_state = _decode_tokens(kernels, q, k, v, g, beta, None)
     torch.mps.synchronize()
     torch.testing.assert_close(prefill_out.cpu(), decode_out.cpu(), atol=5e-3, rtol=5e-3)
     torch.testing.assert_close(prefill_state.cpu(), decode_state.cpu(), atol=5e-3, rtol=5e-3)

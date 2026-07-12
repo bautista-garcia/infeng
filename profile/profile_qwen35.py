@@ -83,14 +83,15 @@ def profile_delta(a):
     beta = torch.rand(batch, a.seq_len, heads, device=device, dtype=dtype).contiguous()
     initial = torch.randn(batch, heads, dim, dim, device=device, dtype=torch.float32) if a.seq_len == 1 else None
     kernels = get_delta_rule_kernels()
+    run = kernels.decode if a.seq_len == 1 else kernels.prefill
     with torch.inference_mode():
-        _, _ = kernels(q, k, v, g, beta, initial.clone() if initial is not None else None)
+        _, _ = run(q, k, v, g, beta, initial.clone() if initial is not None else None)
         sync()
         before = torch.mps.driver_allocated_memory()
         stack, gputrace = capture(f"delta_{'decode' if a.seq_len == 1 else 'prefill'}_L{a.seq_len}")
         start = perf_counter()
         with stack, torch.profiler.record_function(f"delta_{'decode' if a.seq_len == 1 else 'prefill'}"):
-            out, state = kernels(q, k, v, g, beta, initial.clone() if initial is not None else None)
+            out, state = run(q, k, v, g, beta, initial.clone() if initial is not None else None)
             torch.mps.synchronize()
         elapsed, after = perf_counter() - start, torch.mps.driver_allocated_memory()
     return {"target": "delta", "kind": "decode" if a.seq_len == 1 else "prefill", "shape": tuple(q.shape),
@@ -115,15 +116,16 @@ def profile_quant_linear(a):
     x = torch.randn((m, k) if m > 1 else (k,), device=device, dtype=dtype).contiguous()
     weight = QuantWeight((n, k), a.quant_type, data.to(device))
     kernels = get_quant_linear_kernels()
+    run = kernels.decode if m == 1 else kernels.prefill
     with torch.inference_mode():
-        _ = kernels(x, weight)
+        _ = run(x, weight)
         sync()
         before = torch.mps.driver_allocated_memory()
         stack, gputrace = capture(f"quant_linear_{a.quant_type.lower()}_"
                                   f"{'decode' if m == 1 else 'prefill'}_M{m}_K{k}_N{n}")
         start = perf_counter()
         with stack, torch.profiler.record_function(f"quant_linear_{a.quant_type}_{'decode' if m == 1 else 'prefill'}"):
-            y = kernels(x, weight)
+            y = run(x, weight)
             torch.mps.synchronize()
         elapsed, after = perf_counter() - start, torch.mps.driver_allocated_memory()
     return {"target": "quant-linear", "kind": "decode" if m == 1 else "prefill", "shape": tuple(x.shape),

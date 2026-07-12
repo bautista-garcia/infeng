@@ -45,30 +45,30 @@ def main():
     with torch.inference_mode():
         for i in range(a.warmup):
             print(f"warmup={i + 1}/{a.warmup}", flush=True)
-            logits, cache = model(ids, use_cache=True)
+            logits, memory = engine.prefill(ids)
             nxt = logits[:, -1].float().argmax(-1, keepdim=True)
             for _ in range(a.decode):
-                logits, cache = model(nxt, cache=cache, use_cache=True)
+                logits, memory = engine.decode(nxt, memory)
                 nxt = logits[:, -1].float().argmax(-1, keepdim=True)
-            del logits, cache, nxt
+            del logits, memory, nxt
             gc.collect(); torch.mps.empty_cache(); torch.mps.synchronize()
 
         ttft, decode, peak = [], [], torch.mps.driver_allocated_memory()
         for i in range(a.iters):
             print(f"iter={i + 1}/{a.iters} prefill", flush=True)
             torch.mps.synchronize(); start = perf_counter()
-            logits, cache = model(ids, use_cache=True)
+            logits, memory = engine.prefill(ids)
             box = logits[:, -1].float().argmax(-1, keepdim=True)
             torch.mps.synchronize(); ttft.append(perf_counter() - start)
 
             print(f"iter={i + 1}/{a.iters} decode={a.decode}", flush=True)
             torch.mps.synchronize(); start = perf_counter()
             for _ in range(a.decode):
-                logits, cache = model(box, cache=cache, use_cache=True)
+                logits, memory = engine.decode(box, memory)
                 box = logits[:, -1].float().argmax(-1, keepdim=True)
             torch.mps.synchronize(); decode.append(perf_counter() - start)
             peak = max(peak, torch.mps.driver_allocated_memory())
-            del logits, cache, box
+            del logits, memory, box
             gc.collect(); torch.mps.empty_cache(); torch.mps.synchronize()
 
     ttft_s, decode_s = sum(ttft) / len(ttft), sum(decode) / len(decode)
