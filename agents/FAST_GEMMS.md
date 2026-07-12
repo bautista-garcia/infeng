@@ -1,0 +1,15 @@
+Yes. I found several public writeups/benchmark docs with numbers above your ~2.5 TFLOPS, but the apples-to-apples caveat is big: many are FP16, MPS/MLX-backed, larger SoCs, or M5 Neural Accelerator paths.
+
+| Source | Reported Better Number | Why It Matters |
+|---|---:|---|
+| [Draw Things: Metal Quantized Attention, Apr 2026](https://releases.drawthings.ai/p/metal-quantized-attention-pulling) | ~60 TFLOPS FP16 matmul on M5 Max; ~110 TFLOPS quantized attention | Closest philosophically to fused quant/dequant work. Uses M5 Neural Accelerators, so not comparable to M1-M4 Metal kernels. |
+| [Hazy Research: ThunderMittens for Metal, Nov 2024](https://hazyresearch.stanford.edu/blog/2024-11-28-tk-mlx) | GEMM graph shows roughly 3.8-5.7 TFLOPS on M2 Pro | Hand-written/DSL Metal GEMM using `metal::simd_matrix<T,8,8>`, reported ~9% faster than MLX on most GEMM sizes. Very worth reading. |
+| [ForgeLLM: beating llama.cpp/MLX](https://github.com/sauravpanda/forge-llm/blob/main/blog/beating-llama-cpp.md) + [MMA flash/decode follow-up](https://github.com/sauravpanda/forge-llm/blob/main/blog/mma-flash-and-decode.md) | Matmul around ~4 TFLOPS in Q8 prefill path; corrected end-to-end long-context number closer to ~3 TFLOPS | Probably the closest to your fused dequant + prefill setup. Good notes on `simdgroup_matrix`, tiered Q8 MMA kernels, and the attention bottleneck. |
+| [bkvogel/metal_performance_testing](https://github.com/bkvogel/metal_performance_testing) | Hand-written Metal FP32 kernel peaks ~3.8 TFLOPS on M1 Max; MPSMatrixMultiplication ~7 TFLOPS | Older but concrete. Interesting because the custom shader beats 2.5 without using the percisely async-copy trick. |
+| [Training an LLM in Swift, May 2026](https://michael.sintim-koree.com/blog/training-llm-swift-matrix-mult-gflops-tflops) | ~4.2 TFLOPS on M2 Max with `simdgroup_matrix` | Blog-style walkthrough from naive to tiled to simdgroup-matrix GEMM. Less reproducible than the repos, but useful optimization narrative. |
+| [Draw Things: Metal FlashAttention, 2023](https://engineering.drawthings.ai/p/integrating-metal-flashattention-accelerating-the-heart-of-image-generation-in-the-apple-ecosystem-16a86142eb18) | MPS “maxed out at 2000 GFLOPS” for their attention benchmark while MFA was order-of-magnitude higher; GEMM integration gave 10-30% app speedups | Relevant for thin GEMMs and transformer-ish shapes, not square GEMM. Uses the same `simdgroup_async_copy` lineage as the percisely post. |
+| [tensorcore benchmark docs](https://github.com/tsotchke/tensorcore/blob/master/docs/benchmarks.md) | M2 Ultra FP16 GEMM 17.88 TFLOPS at 4096³; Q4_0 GEMV core ~632 GB/s effective | Not a blog, but the GEMV note is useful: it frames decode as bandwidth-bound and reports ~79% of theoretical bandwidth. |
+
+[Fast GEMM using async copies](https://percisely.xyz/gemm)
+[Sparse Buffers for KV cache](https://trymirai.com/blog/sparse-buffers-for-kv-cache)
+[Metal Benchmark Numbers](https://github.com/philipturner/metal-benchmarks/tree/main)
