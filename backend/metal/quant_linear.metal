@@ -223,6 +223,115 @@ kernel void q4_k_embed(device half* y [[buffer(0)]], device const long* ids [[bu
     y[t * K + col] = half(float(h16(w + o)) * float(sc) * float(v) - float(h16(w + o + 2)) * float(mn));
 }
 
+static inline void gdn_store_half2(device half* yq, device half* yz, device half* yb, device half* ya,
+                                   long m, uint row, half2 v) {
+    if (row < 8192) reinterpret_cast<device half2*>(yq)[(m * 8192 + row) >> 1] = v;
+    else if (row < 12288) reinterpret_cast<device half2*>(yz)[(m * 4096 + row - 8192) >> 1] = v;
+    else if (row < 12320) reinterpret_cast<device half2*>(yb)[(m * 32 + row - 12288) >> 1] = v;
+    else reinterpret_cast<device half2*>(ya)[(m * 32 + row - 12320) >> 1] = v;
+}
+
+static inline void gdn_store_half(device half* yq, device half* yz, device half* yb, device half* ya,
+                                  uint row, half v) {
+    if (row < 8192) yq[row] = v;
+    else if (row < 12288) yz[row - 8192] = v;
+    else if (row < 12320) yb[row - 12288] = v;
+    else ya[row - 12320] = v;
+}
+
+static inline void gdn_q5_f16_tile(threadgroup half* b_tile, device const uchar* wq, device const uchar* wz,
+                                   device const half* wb, device const half* wa, uint n0, uint kb,
+                                   uint simd_lane, uint simd_group) {
+    for (uint p = 0; p < 4; ++p) {
+        uint n = simd_group * 4 + p, row = n0 + n;
+        if (row < 12288) {
+            device const uchar* w = row < 8192 ? wq : wz;
+            uint local = row < 8192 ? row : row - 8192;
+            long o = long(local) * 16 * 176 + kb * 176;
+            float d = float(h16(w + o)), dm = float(h16(w + o + 2));
+            uchar hm = w[o + 16 + simd_lane];
+            for (uint t = 0; t < 4; ++t) {
+                uchar sc, mn, q = w[o + 48 + t * 32 + simd_lane];
+                uint r = t * 64 + simd_lane, j = t * 2;
+                scale_min_k4(j, w + o + 4, sc, mn);
+                b_tile[r * 16 + n] = half(d * float(sc) * float((q & 15) + ((hm & (1 << j)) ? 16 : 0)) - dm * float(mn));
+                scale_min_k4(j + 1, w + o + 4, sc, mn);
+                b_tile[(r + 32) * 16 + n] = half(d * float(sc) * float((q >> 4) + ((hm & (1 << (j + 1))) ? 16 : 0)) - dm * float(mn));
+            }
+        } else {
+            device const half* w = row < 12320 ? wb : wa;
+            uint local = row < 12320 ? row - 12288 : row - 12320;
+            for (uint t = 0; t < 8; ++t) {
+                uint r = t * 32 + simd_lane;
+                b_tile[r * 16 + n] = w[local * 4096 + kb * 256 + r];
+            }
+        }
+    }
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void gdn_in_proj_prefill(device half* yq [[buffer(0)]], device half* yz [[buffer(1)]],
+                                device half* yb [[buffer(2)]], device half* ya [[buffer(3)]],
+                                device const half* x [[buffer(4)]], device const uchar* wq [[buffer(5)]],
+                                device const uchar* wz [[buffer(6)]], device const half* wb [[buffer(7)]],
+                                device const half* wa [[buffer(8)]], constant long& M [[buffer(9)]],
+                                uint3 lane3 [[thread_position_in_threadgroup]],
+                                uint simd_lane [[thread_index_in_simdgroup]],
+                                uint simd_group [[simdgroup_index_in_threadgroup]],
+                                uint3 group [[threadgroup_position_in_grid]]) {
+    uint lane = lane3.x, rb = simd_group * 8;
+    long n0 = long(group.x) * 16, m0 = long(group.y) * 32;
+    threadgroup half b_tile[256 * 16];
+    threadgroup float scratch[4 * 2 * 64];
+    simdgroup_matrix<float, 8, 8> c0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> c1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (long k0 = 0; k0 < 4096; k0 += 256) {
+        device const half* x_ptr = x + m0 * 4096 + k0;
+        gdn_q5_f16_tile(b_tile, wq, wz, wb, wa, uint(n0), uint(k0 / 256), simd_lane, simd_group);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_matrix<half, 8, 8> a, b;
+        for (uint ko = 0; ko < 256; ko += 8) {
+            simdgroup_load(a, x_ptr, 4096, ulong2(ko, rb));
+            simdgroup_load(b, b_tile, 16, ulong2(0, ko)); simdgroup_multiply_accumulate(c0, a, b, c0);
+            simdgroup_load(b, b_tile, 16, ulong2(8, ko)); simdgroup_multiply_accumulate(c1, a, b, c1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(c0, scratch + simd_group * 128, 16);
+    simdgroup_store(c1, scratch + simd_group * 128 + 8, 16);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = lane; idx < 32 * 8; idx += 128) {
+        uint r = idx >> 3, cp = idx & 7, e = ((r & 7) << 4) + (cp << 1);
+        gdn_store_half2(yq, yz, yb, ya, m0 + r, uint(n0) + (cp << 1),
+                        half2(half(scratch[(r >> 3) * 128 + e]), half(scratch[(r >> 3) * 128 + e + 1])));
+    }
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void gdn_in_proj_decode(device half* yq [[buffer(0)]], device half* yz [[buffer(1)]],
+                               device half* yb [[buffer(2)]], device half* ya [[buffer(3)]],
+                               device const half* x [[buffer(4)]], device const uchar* wq [[buffer(5)]],
+                               device const uchar* wz [[buffer(6)]], device const half* wb [[buffer(7)]],
+                               device const half* wa [[buffer(8)]],
+                               uint simd_lane [[thread_index_in_simdgroup]],
+                               uint simd_group [[simdgroup_index_in_threadgroup]],
+                               uint3 group [[threadgroup_position_in_grid]]) {
+    uint row = group.x * 4 + simd_group;
+    if (row >= 12352) return;
+    float acc = 0.0f;
+    if (row < 12288) {
+        device const uchar* w = row < 8192 ? wq : wz;
+        uint local = row < 8192 ? row : row - 8192;
+        for (uint kb = 0; kb < 16; ++kb) q5k_decode_block(acc, x, w, kb * 256, kb, local, simd_lane, 4096);
+    } else {
+        device const half* w = row < 12320 ? wb : wa;
+        uint local = row < 12320 ? row - 12288 : row - 12320;
+        for (uint k = simd_lane; k < 4096; k += 32) acc = fma(float(x[k]), float(w[local * 4096 + k]), acc);
+    }
+    acc = simd_sum(acc);
+    if (simd_lane == 0) gdn_store_half(yq, yz, yb, ya, row, half(acc));
+}
+
 PREFILL_QK_V2_BN16(q4_k_k4096_n1024_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 1024)
 PREFILL_QK_V2_BN16(q4_k_k4096_n4096_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 4096)
 PREFILL_QK_V2_BN16(q4_k_k12288_n4096_prefill_v2_bn16, Q4K_DEQUANT_TILE, 12288, 4096)
