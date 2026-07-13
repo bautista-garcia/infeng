@@ -222,9 +222,13 @@ class GatedDeltaNet(nn.Module):
             hidden_states = hidden_states * attention_mask[:, :, None].type(hidden_states.dtype)
 
         batch_size, seq_len, _ = hidden_states.shape
-        mixed_qkv, z, b, a = self.in_proj_qkv.kernels.gdn_in_proj(
-            hidden_states.contiguous(), self.in_proj_qkv.weight, self.in_proj_z.weight, self.in_proj_b.weight,
-            self.in_proj_a.weight)
+        if batch_size * seq_len == 1:
+            mixed_qkv, z, b, a = self.fused_layers.gdn_in_proj_decode(
+                hidden_states.contiguous(), self.in_proj_qkv.weight, self.in_proj_z.weight, self.in_proj_b.weight,
+                self.in_proj_a.weight)
+        else:
+            mixed_qkv, z, b, a = (proj(hidden_states) for proj in (
+                self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a))
         z = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         beta = torch.sigmoid(b)
         g = -self.A_log.data.float().exp() * F.softplus(a.float() + self.dt_bias.data)

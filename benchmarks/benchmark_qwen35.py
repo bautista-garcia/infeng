@@ -21,6 +21,8 @@ BANDWIDTH_BPS, FLOPS = 200e9, 13.6e12
 # For a tinygrad comparison:
 # JITBEAM=2 python -c 'import sys, runpy; sys.setrecursionlimit(100000); import sys as s; s.argv=["tinygrad/llm/cli.py","--model","qwen3.5:4b","--warmup","--benchmark"]; runpy.run_path("tinygrad/llm/cli.py", run_name="__main__")'
 
+# For a llama.cpp comparison:
+# llama-bench -m weights/Qwen3.5-9B-UD-Q4_K_XL.gguf -r 3 -pg 32,32 -ngl 999
 
 def main():
     p = argparse.ArgumentParser(description="Qwen3.5 MPS macro benchmark")

@@ -106,22 +106,6 @@ class QuantLinearKernels:
                             threads=[((k + 255) // 256) * 256, tokens, 1], group_size=[256, 1, 1])
         return y
 
-    def gdn_in_proj_decode(self, x: torch.Tensor, w_qkv: Any, w_z: Any, w_b: Any, w_a: Any) -> tuple[torch.Tensor, ...]:
-        lead = x.shape[:-1]
-        yq = torch.empty((*lead, 8192), dtype=x.dtype, device=x.device)
-        yz = torch.empty((*lead, 4096), dtype=x.dtype, device=x.device)
-        yb = torch.empty((*lead, 32), dtype=x.dtype, device=x.device)
-        ya = torch.empty_like(yb)
-        self.lib.gdn_in_proj_decode(yq, yz, yb, ya, x, w_qkv.data, w_z.data, w_b.data, w_a.data,
-                                    threads=[((12352 + 3) // 4) * 128, 1, 1], group_size=[128, 1, 1])
-        return yq, yz, yb, ya
-
-    def gdn_in_proj(self, x: torch.Tensor, w_qkv: Any, w_z: Any, w_b: Any, w_a: Any) -> tuple[torch.Tensor, ...]:
-        if x.numel() // x.shape[-1] == 1:
-            return self.gdn_in_proj_decode(x, w_qkv, w_z, w_b, w_a)
-        return tuple(torch.nn.functional.linear(x, w.data) if w.torch_dtype else self.linear(x, w)
-                     for w in (w_qkv, w_z, w_b, w_a))
-
 
 def get_quant_linear_kernels() -> QuantLinearKernels:
     global _QUANT_LINEAR_KERNELS
@@ -133,6 +117,16 @@ def get_quant_linear_kernels() -> QuantLinearKernels:
 @dataclass
 class FusedLayerKernels:
     lib: object
+
+    def gdn_in_proj_decode(self, x: torch.Tensor, w_qkv: Any, w_z: Any, w_b: Any, w_a: Any) -> tuple[torch.Tensor, ...]:
+        lead = x.shape[:-1]
+        yq = torch.empty((*lead, 8192), dtype=x.dtype, device=x.device)
+        yz = torch.empty((*lead, 4096), dtype=x.dtype, device=x.device)
+        yb = torch.empty((*lead, 32), dtype=x.dtype, device=x.device)
+        ya = torch.empty_like(yb)
+        self.lib.gdn_in_proj_decode(yq, yz, yb, ya, x, w_qkv.data, w_z.data, w_b.data, w_a.data,
+                                    threads=[((12352 + 3) // 4) * 128, 1, 1], group_size=[128, 1, 1])
+        return yq, yz, yb, ya
 
     def causal_conv_silu(self, x: torch.Tensor, weight: torch.Tensor,
                          prev_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -153,5 +147,5 @@ class FusedLayerKernels:
 def get_fused_layer_kernels() -> FusedLayerKernels:
     global _FUSED_LAYER_KERNELS
     if _FUSED_LAYER_KERNELS is None:
-        _FUSED_LAYER_KERNELS = FusedLayerKernels(_compile("fused_layers.metal"))
+        _FUSED_LAYER_KERNELS = FusedLayerKernels(_compile("fused_kernels.metal"))
     return _FUSED_LAYER_KERNELS
