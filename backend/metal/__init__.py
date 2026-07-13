@@ -27,6 +27,10 @@ def _compile(name: str):
 class DeltaRuleKernels:
     lib: object
 
+    def __call__(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor,
+                 beta: torch.Tensor, initial_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        return (self.decode if query.shape[1] == 1 else self.prefill)(query, key, value, g, beta, initial_state)
+
     def prefill(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor,
                 beta: torch.Tensor, initial_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, num_heads, _ = query.shape
@@ -76,6 +80,9 @@ class QuantLinearKernels:
         return (getattr(self.lib, f"{base}_decode_v2_tg{decode_tg}_reg"),
                 getattr(self.lib, base + "_prefill_v2_bn16"), decode_tg, decode_rows), k, n
 
+    def linear(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
+        return (self.decode if x.numel() // x.shape[-1] == 1 else self.prefill)(x, weight)
+
     def prefill(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
         (_, prefill, _, _), k, n = self._spec(x, weight)
         m, x2 = x.numel() // k, x.reshape(x.numel() // k, k)
@@ -108,6 +115,12 @@ class QuantLinearKernels:
         self.lib.gdn_in_proj_decode(yq, yz, yb, ya, x, w_qkv.data, w_z.data, w_b.data, w_a.data,
                                     threads=[((12352 + 3) // 4) * 128, 1, 1], group_size=[128, 1, 1])
         return yq, yz, yb, ya
+
+    def gdn_in_proj(self, x: torch.Tensor, w_qkv: Any, w_z: Any, w_b: Any, w_a: Any) -> tuple[torch.Tensor, ...]:
+        if x.numel() // x.shape[-1] == 1:
+            return self.gdn_in_proj_decode(x, w_qkv, w_z, w_b, w_a)
+        return tuple(torch.nn.functional.linear(x, w.data) if w.torch_dtype else self.linear(x, w)
+                     for w in (w_qkv, w_z, w_b, w_a))
 
 
 def get_quant_linear_kernels() -> QuantLinearKernels:

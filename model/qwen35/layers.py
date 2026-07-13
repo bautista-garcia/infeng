@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from functools import partialmethod
 from typing import Any
 
 import torch
@@ -34,14 +33,10 @@ class Linear(nn.Module):
         self.bias = None
         self.kernels = get_quant_linear_kernels()
 
-    def _run(self, x: torch.Tensor, decode: bool) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
-        y = F.linear(x, w.data) if w.torch_dtype else (self.kernels.decode if decode else self.kernels.prefill)(
-            x.contiguous(), w)
+        y = F.linear(x, w.data) if w.torch_dtype else self.kernels.linear(x.contiguous(), w)
         return y if self.bias is None else y + self.bias.data
-
-    prefill = partialmethod(_run, decode=False)
-    decode = partialmethod(_run, decode=True)
 
 
 LMHead = Linear
@@ -89,13 +84,9 @@ class MLP(nn.Module):
         self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
 
-    def _run(self, x: torch.Tensor, decode: bool) -> torch.Tensor:
-        mode = "decode" if decode else "prefill"
-        gate, up = (getattr(proj, mode)(x) for proj in (self.gate_proj, self.up_proj))
-        return getattr(self.down_proj, mode)(F.silu(gate) * up)
-
-    prefill = partialmethod(_run, decode=False)
-    decode = partialmethod(_run, decode=True)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = (proj(x) for proj in (self.gate_proj, self.up_proj))
+        return self.down_proj(F.silu(gate) * up)
 
 
 class RotaryEmbedding(nn.Module):
@@ -156,18 +147,17 @@ class FullAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
         self.rotary_emb = RotaryEmbedding(config)
 
-    def _run(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
-             attention_mask: torch.Tensor | None = None, decode: bool = False) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
+                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        project = lambda proj: (proj.decode if decode else proj.prefill)(hidden_states)
-        q_and_gate = project(self.q_proj).view(batch_size, seq_len, self.num_heads, self.head_dim * 2)
+        q_and_gate = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim * 2)
         query_states, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
         query_states = self.q_norm(query_states).transpose(1, 2)
-        key_states = self.k_norm(project(self.k_proj).view(batch_size, seq_len, self.num_key_value_heads,
-                                                           self.head_dim)).transpose(1, 2)
-        value_states = project(self.v_proj).view(batch_size, seq_len, self.num_key_value_heads,
-                                                 self.head_dim).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads,
+                                                                 self.head_dim)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads,
+                                                       self.head_dim).transpose(1, 2)
         query_states, key_states = self.rotary_emb(query_states, key_states, hidden_states, position_ids)
 
         key_mask = None
@@ -197,10 +187,7 @@ class FullAttention(nn.Module):
                                                      dropout_p=0.0, is_causal=is_causal)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         attn_output = attn_output * torch.sigmoid(gate)
-        return self.o_proj.decode(attn_output) if decode else self.o_proj.prefill(attn_output)
-
-    prefill = partialmethod(_run, decode=False)
-    decode = partialmethod(_run, decode=True)
+        return self.o_proj(attn_output)
 
 
 class GatedDeltaNet(nn.Module):
@@ -229,29 +216,22 @@ class GatedDeltaNet(nn.Module):
         self.delta_rule_metal = get_delta_rule_kernels()
         self.fused_layers = get_fused_layer_kernels()
 
-    def _run(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
-             attention_mask: torch.Tensor | None = None, decode: bool = False) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
+                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         if attention_mask is not None and attention_mask.ndim == 2:
             hidden_states = hidden_states * attention_mask[:, :, None].type(hidden_states.dtype)
 
         batch_size, seq_len, _ = hidden_states.shape
-        if decode:
-            mixed_qkv, z, b, a = self.in_proj_qkv.kernels.gdn_in_proj_decode(
-                hidden_states.contiguous(), self.in_proj_qkv.weight, self.in_proj_z.weight, self.in_proj_b.weight,
-                self.in_proj_a.weight)
-        else:
-            mixed_qkv, z, b, a = (proj.prefill(hidden_states) for proj in (
-                self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a))
+        mixed_qkv, z, b, a = self.in_proj_qkv.kernels.gdn_in_proj(
+            hidden_states.contiguous(), self.in_proj_qkv.weight, self.in_proj_z.weight, self.in_proj_b.weight,
+            self.in_proj_a.weight)
         z = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         beta = torch.sigmoid(b)
         g = -self.A_log.data.float().exp() * F.softplus(a.float() + self.dt_bias.data)
-        return self._delta(mixed_qkv, z, beta, g, batch_size, seq_len, memory, decode)
-
-    prefill = partialmethod(_run, decode=False)
-    decode = partialmethod(_run, decode=True)
+        return self._delta(mixed_qkv, z, beta, g, batch_size, seq_len, memory)
 
     def _delta(self, mixed_qkv: torch.Tensor, z: torch.Tensor, beta: torch.Tensor, g: torch.Tensor,
-               batch_size: int, seq_len: int, memory: Any, decode: bool) -> torch.Tensor:
+               batch_size: int, seq_len: int, memory: Any) -> torch.Tensor:
         mixed_qkv, conv_state = self.fused_layers.causal_conv_silu(mixed_qkv, self.conv1d_weight.data,
                                                                     None if memory is None else memory.conv_state)
         if memory is not None:
@@ -268,8 +248,7 @@ class GatedDeltaNet(nn.Module):
             key = key.repeat(1, 1, repeat, 1)
 
         initial_state = None if memory is None else memory.recurrent_state
-        output, recurrent_state = (self.delta_rule_metal.decode if decode else self.delta_rule_metal.prefill)(
-            query, key, value, g, beta, initial_state)
+        output, recurrent_state = self.delta_rule_metal(query, key, value, g, beta, initial_state)
         if memory is not None:
             memory.recurrent_state = recurrent_state
 
@@ -277,7 +256,7 @@ class GatedDeltaNet(nn.Module):
         z = z.reshape(-1, self.head_v_dim)
         output = self.fused_layers.rmsnorm_gated(output, z, self.norm.weight.data, self.norm.eps).reshape(
             batch_size, seq_len, self.value_dim)
-        return self.out_proj.decode(output) if decode else self.out_proj.prefill(output)
+        return self.out_proj(output)
 
 
 class DecoderLayer(nn.Module):
@@ -296,20 +275,16 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
         self.mlp = MLP(config)
 
-    def _run(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
-             attention_mask: torch.Tensor | None = None, decode: bool = False) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
+                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         attn = getattr(self, self._attn_name)
-        hidden_states = (attn.decode if decode else attn.prefill)(hidden_states, position_ids, memory,
-                                                                  attention_mask=attention_mask)
+        hidden_states = attn(hidden_states, position_ids, memory, attention_mask=attention_mask)
 
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = (self.mlp.decode if decode else self.mlp.prefill)(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
-
-    prefill = partialmethod(_run, decode=False)
-    decode = partialmethod(_run, decode=True)

@@ -34,16 +34,15 @@ class InferenceEngine:
             logits = logits.scatter(1, sorted_idx, sorted_logits.masked_fill(remove, -torch.inf))
         return torch.multinomial(F.softmax(logits, dim=-1), 1)
 
-    def _run(self, input_ids: torch.Tensor, memory: RequestMemory, decode: bool) -> tuple[torch.Tensor, RequestMemory]:
-        return (self.model.decode if decode else self.model.prefill)(
-            input_ids, memory.position_ids(input_ids), memory), memory
+    def _run(self, input_ids: torch.Tensor, memory: RequestMemory) -> tuple[torch.Tensor, RequestMemory]:
+        return self.model(input_ids, memory.position_ids(input_ids), memory), memory
 
     def prefill(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, RequestMemory]:
         memory = self.memory.new_request()
-        return self._run(input_ids, memory, False)
+        return self._run(input_ids, memory)
 
     def decode(self, input_ids: torch.Tensor, memory: RequestMemory) -> tuple[torch.Tensor, RequestMemory]:
-        return self._run(input_ids, memory, True)
+        return self._run(input_ids, memory)
 
     @torch.no_grad()
     def generate(self, messages: list[dict] | str, max_new_tokens: int | None = None, thinking: bool = False,
