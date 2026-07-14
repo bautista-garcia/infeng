@@ -88,7 +88,7 @@ static inline void scale_min_k4(uint j, device const uchar* q, thread uchar& d, 
         } \
     }
 
-#define PREFILL_QK_V2_BN16(name, dequant, K, N) \
+#define PREFILL_QK(name, dequant, K, N) \
 [[max_total_threads_per_threadgroup(128)]] \
 kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], \
                  device const uchar* w [[buffer(2)]], constant long& M [[buffer(3)]], \
@@ -194,7 +194,7 @@ static inline void iq4xs_decode_block(thread float& acc, device const half* x, d
     }
 }
 
-#define DECODE_QK_V2_REG_TG(name, decode_block, TG, NSIMD, K, N) \
+#define DECODE_QK(name, decode_block, TG, NSIMD, K, N) \
 [[max_total_threads_per_threadgroup(TG)]] \
 kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], \
                  device const uchar* w [[buffer(2)]], uint simd_lane [[thread_index_in_simdgroup]], \
@@ -223,40 +223,40 @@ kernel void q4_k_embed(device half* y [[buffer(0)]], device const long* ids [[bu
     y[t * K + col] = half(float(h16(w + o)) * float(sc) * float(v) - float(h16(w + o + 2)) * float(mn));
 }
 
-PREFILL_QK_V2_BN16(q4_k_k4096_n1024_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 1024)
-PREFILL_QK_V2_BN16(q4_k_k4096_n4096_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 4096)
-PREFILL_QK_V2_BN16(q4_k_k12288_n4096_prefill_v2_bn16, Q4K_DEQUANT_TILE, 12288, 4096)
-PREFILL_QK_V2_BN16(q4_k_k4096_n8192_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 8192)
-PREFILL_QK_V2_BN16(q4_k_k4096_n12288_prefill_v2_bn16, Q4K_DEQUANT_TILE, 4096, 12288)
+PREFILL_QK(q4_k_k4096_n1024_prefill, Q4K_DEQUANT_TILE, 4096, 1024)
+PREFILL_QK(q4_k_k4096_n4096_prefill, Q4K_DEQUANT_TILE, 4096, 4096)
+PREFILL_QK(q4_k_k12288_n4096_prefill, Q4K_DEQUANT_TILE, 12288, 4096)
+PREFILL_QK(q4_k_k4096_n8192_prefill, Q4K_DEQUANT_TILE, 4096, 8192)
+PREFILL_QK(q4_k_k4096_n12288_prefill, Q4K_DEQUANT_TILE, 4096, 12288)
 
-DECODE_QK_V2_REG_TG(q4_k_k4096_n1024_decode_v2_tg256_reg, q4k_decode_block, 256, 8, 4096, 1024)
-DECODE_QK_V2_REG_TG(q4_k_k4096_n4096_decode_v2_tg128_reg, q4k_decode_block, 128, 4, 4096, 4096)
-DECODE_QK_V2_REG_TG(q4_k_k12288_n4096_decode_v2_tg128_reg, q4k_decode_block, 128, 4, 12288, 4096)
-DECODE_QK_V2_REG_TG(q4_k_k4096_n8192_decode_v2_tg128_reg, q4k_decode_block, 128, 4, 4096, 8192)
-DECODE_QK_V2_REG_TG(q4_k_k4096_n12288_decode_v2_tg128_reg, q4k_decode_block, 128, 4, 4096, 12288)
+DECODE_QK(q4_k_k4096_n1024_decode, q4k_decode_block, 256, 8, 4096, 1024)
+DECODE_QK(q4_k_k4096_n4096_decode, q4k_decode_block, 128, 4, 4096, 4096)
+DECODE_QK(q4_k_k12288_n4096_decode, q4k_decode_block, 128, 4, 12288, 4096)
+DECODE_QK(q4_k_k4096_n8192_decode, q4k_decode_block, 128, 4, 4096, 8192)
+DECODE_QK(q4_k_k4096_n12288_decode, q4k_decode_block, 128, 4, 4096, 12288)
 
-PREFILL_QK_V2_BN16(q5_k_k4096_n1024_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 1024)
-PREFILL_QK_V2_BN16(q5_k_k4096_n4096_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 4096)
-PREFILL_QK_V2_BN16(q5_k_k12288_n4096_prefill_v2_bn16, Q5K_DEQUANT_TILE, 12288, 4096)
-PREFILL_QK_V2_BN16(q5_k_k4096_n8192_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 8192)
-PREFILL_QK_V2_BN16(q5_k_k4096_n12288_prefill_v2_bn16, Q5K_DEQUANT_TILE, 4096, 12288)
+PREFILL_QK(q5_k_k4096_n1024_prefill, Q5K_DEQUANT_TILE, 4096, 1024)
+PREFILL_QK(q5_k_k4096_n4096_prefill, Q5K_DEQUANT_TILE, 4096, 4096)
+PREFILL_QK(q5_k_k12288_n4096_prefill, Q5K_DEQUANT_TILE, 12288, 4096)
+PREFILL_QK(q5_k_k4096_n8192_prefill, Q5K_DEQUANT_TILE, 4096, 8192)
+PREFILL_QK(q5_k_k4096_n12288_prefill, Q5K_DEQUANT_TILE, 4096, 12288)
 
-DECODE_QK_V2_REG_TG(q5_k_k4096_n1024_decode_v2_tg256_reg, q5k_decode_block, 256, 8, 4096, 1024)
-DECODE_QK_V2_REG_TG(q5_k_k4096_n4096_decode_v2_tg128_reg, q5k_decode_block, 128, 4, 4096, 4096)
-DECODE_QK_V2_REG_TG(q5_k_k12288_n4096_decode_v2_tg128_reg, q5k_decode_block, 128, 4, 12288, 4096)
-DECODE_QK_V2_REG_TG(q5_k_k4096_n8192_decode_v2_tg128_reg, q5k_decode_block, 128, 4, 4096, 8192)
-DECODE_QK_V2_REG_TG(q5_k_k4096_n12288_decode_v2_tg128_reg, q5k_decode_block, 128, 4, 4096, 12288)
+DECODE_QK(q5_k_k4096_n1024_decode, q5k_decode_block, 256, 8, 4096, 1024)
+DECODE_QK(q5_k_k4096_n4096_decode, q5k_decode_block, 128, 4, 4096, 4096)
+DECODE_QK(q5_k_k12288_n4096_decode, q5k_decode_block, 128, 4, 12288, 4096)
+DECODE_QK(q5_k_k4096_n8192_decode, q5k_decode_block, 128, 4, 4096, 8192)
+DECODE_QK(q5_k_k4096_n12288_decode, q5k_decode_block, 128, 4, 4096, 12288)
 
-PREFILL_QK_V2_BN16(q6_k_k4096_n1024_prefill_v2_bn16, Q6K_DEQUANT_TILE, 4096, 1024)
-PREFILL_QK_V2_BN16(q6_k_k12288_n4096_prefill_v2_bn16, Q6K_DEQUANT_TILE, 12288, 4096)
-PREFILL_QK_V2_BN16(q6_k_k4096_n248320_prefill_v2_bn16, Q6K_DEQUANT_TILE, 4096, 248320)
+PREFILL_QK(q6_k_k4096_n1024_prefill, Q6K_DEQUANT_TILE, 4096, 1024)
+PREFILL_QK(q6_k_k12288_n4096_prefill, Q6K_DEQUANT_TILE, 12288, 4096)
+PREFILL_QK(q6_k_k4096_n248320_prefill, Q6K_DEQUANT_TILE, 4096, 248320)
 
-DECODE_QK_V2_REG_TG(q6_k_k4096_n1024_decode_v2_tg256_reg, q6k_decode_block, 256, 8, 4096, 1024)
-DECODE_QK_V2_REG_TG(q6_k_k12288_n4096_decode_v2_tg128_reg, q6k_decode_block, 128, 4, 12288, 4096)
-DECODE_QK_V2_REG_TG(q6_k_k4096_n248320_decode_v2_tg128_reg, q6k_decode_block, 128, 4, 4096, 248320)
+DECODE_QK(q6_k_k4096_n1024_decode, q6k_decode_block, 256, 8, 4096, 1024)
+DECODE_QK(q6_k_k12288_n4096_decode, q6k_decode_block, 128, 4, 12288, 4096)
+DECODE_QK(q6_k_k4096_n248320_decode, q6k_decode_block, 128, 4, 4096, 248320)
 
-PREFILL_QK_V2_BN16(q8_0_k4096_n4096_prefill_v2_bn16, Q8_0_DEQUANT_TILE, 4096, 4096)
-DECODE_QK_V2_REG_TG(q8_0_k4096_n4096_decode_v2_tg128_reg, q8_0_decode_block, 128, 4, 4096, 4096)
+PREFILL_QK(q8_0_k4096_n4096_prefill, Q8_0_DEQUANT_TILE, 4096, 4096)
+DECODE_QK(q8_0_k4096_n4096_decode, q8_0_decode_block, 128, 4, 4096, 4096)
 
-PREFILL_QK_V2_BN16(iq4_xs_k4096_n12288_prefill, IQ4_XS_DEQUANT_TILE, 4096, 12288)
-DECODE_QK_V2_REG_TG(iq4_xs_k4096_n12288_decode, iq4xs_decode_block, 128, 4, 4096, 12288)
+PREFILL_QK(iq4_xs_k4096_n12288_prefill, IQ4_XS_DEQUANT_TILE, 4096, 12288)
+DECODE_QK(iq4_xs_k4096_n12288_decode, iq4xs_decode_block, 128, 4, 4096, 12288)

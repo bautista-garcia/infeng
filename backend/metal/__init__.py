@@ -12,11 +12,32 @@ _QUANT_LINEAR_KERNELS: "QuantLinearKernels | None" = None
 _FUSED_LAYER_KERNELS: "FusedLayerKernels | None" = None
 # The 32-token Metal prefill solve can become unstable on real Qwen3.5 activations.
 _DELTA_PREFILL_CHUNK = 16
-QUANT_LINEAR_SPECS = {spec: ((256, 8) if spec[2] == 1024 else (128, 4)) for spec in (
-    *[(q, 4096, n) for q in ("Q4_K", "Q5_K") for n in (1024, 4096, 8192, 12288)],
-    ("Q4_K", 12288, 4096), ("Q5_K", 12288, 4096), ("Q6_K", 4096, 1024),
-    ("Q6_K", 12288, 4096), ("Q6_K", 4096, 248320), ("Q8_0", 4096, 4096),
-    ("IQ4_XS", 4096, 12288))}
+MLP_HIDDEN_SIZE = 4096
+MLP_INTERMEDIATE_SIZE = 12288
+MLP_GATE_UP_TG = 512
+MLP_GATE_UP_ROWS = 16
+MLP_GATE_UP_KERNELS = {
+    ("Q4_K", "Q4_K"): "mlp_gate_up_q4_k_decode",
+    ("Q5_K", "Q5_K"): "mlp_gate_up_q5_k_decode",
+    ("IQ4_XS", "IQ4_XS"): "mlp_gate_up_iq4_xs_decode",
+}
+QUANT_LINEAR_KERNELS = {
+    ("Q4_K", 4096, 1024): ("q4_k_k4096_n1024_decode", "q4_k_k4096_n1024_prefill", 256, 8),
+    ("Q4_K", 4096, 4096): ("q4_k_k4096_n4096_decode", "q4_k_k4096_n4096_prefill", 128, 4),
+    ("Q4_K", 4096, 8192): ("q4_k_k4096_n8192_decode", "q4_k_k4096_n8192_prefill", 128, 4),
+    ("Q4_K", 4096, 12288): ("q4_k_k4096_n12288_decode", "q4_k_k4096_n12288_prefill", 128, 4),
+    ("Q4_K", 12288, 4096): ("q4_k_k12288_n4096_decode", "q4_k_k12288_n4096_prefill", 128, 4),
+    ("Q5_K", 4096, 1024): ("q5_k_k4096_n1024_decode", "q5_k_k4096_n1024_prefill", 256, 8),
+    ("Q5_K", 4096, 4096): ("q5_k_k4096_n4096_decode", "q5_k_k4096_n4096_prefill", 128, 4),
+    ("Q5_K", 4096, 8192): ("q5_k_k4096_n8192_decode", "q5_k_k4096_n8192_prefill", 128, 4),
+    ("Q5_K", 4096, 12288): ("q5_k_k4096_n12288_decode", "q5_k_k4096_n12288_prefill", 128, 4),
+    ("Q5_K", 12288, 4096): ("q5_k_k12288_n4096_decode", "q5_k_k12288_n4096_prefill", 128, 4),
+    ("Q6_K", 4096, 1024): ("q6_k_k4096_n1024_decode", "q6_k_k4096_n1024_prefill", 256, 8),
+    ("Q6_K", 12288, 4096): ("q6_k_k12288_n4096_decode", "q6_k_k12288_n4096_prefill", 128, 4),
+    ("Q6_K", 4096, 248320): ("q6_k_k4096_n248320_decode", "q6_k_k4096_n248320_prefill", 128, 4),
+    ("Q8_0", 4096, 4096): ("q8_0_k4096_n4096_decode", "q8_0_k4096_n4096_prefill", 128, 4),
+    ("IQ4_XS", 4096, 12288): ("iq4_xs_k4096_n12288_decode", "iq4_xs_k4096_n12288_prefill", 128, 4),
+}
 
 
 def _compile(name: str):
@@ -70,21 +91,13 @@ def get_delta_rule_kernels() -> DeltaRuleKernels:
 class QuantLinearKernels:
     lib: object
 
-    def _spec(self, x: torch.Tensor, weight: Any):
-        k, n = x.shape[-1], weight.shape[0]
-        decode_tg, decode_rows = QUANT_LINEAR_SPECS[(weight.type_name, k, n)]
-        base = f"{weight.type_name.lower()}_k{k}_n{n}"
-        if weight.type_name == "IQ4_XS":
-            return (getattr(self.lib, base + "_decode"), getattr(self.lib, base + "_prefill"),
-                    decode_tg, decode_rows), k, n
-        return (getattr(self.lib, f"{base}_decode_v2_tg{decode_tg}_reg"),
-                getattr(self.lib, base + "_prefill_v2_bn16"), decode_tg, decode_rows), k, n
-
     def linear(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
         return (self.decode if x.numel() // x.shape[-1] == 1 else self.prefill)(x, weight)
 
     def prefill(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
-        (_, prefill, _, _), k, n = self._spec(x, weight)
+        k, n = x.shape[-1], weight.shape[0]
+        _, prefill_name, _, _ = QUANT_LINEAR_KERNELS[(weight.type_name, k, n)]
+        prefill = getattr(self.lib, prefill_name)
         m, x2 = x.numel() // k, x.reshape(x.numel() // k, k)
         mpad = (m + 31) // 32 * 32
         x2 = x2 if mpad == m else torch.nn.functional.pad(x2, (0, 0, 0, mpad - m))
@@ -93,7 +106,9 @@ class QuantLinearKernels:
         return y2[:m].reshape(*x.shape[:-1], n)
 
     def decode(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
-        (decode, _, decode_tg, decode_rows), k, n = self._spec(x, weight)
+        k, n = x.shape[-1], weight.shape[0]
+        decode_name, _, decode_tg, decode_rows = QUANT_LINEAR_KERNELS[(weight.type_name, k, n)]
+        decode = getattr(self.lib, decode_name)
         y = torch.empty((*x.shape[:-1], n), dtype=x.dtype, device=x.device)
         threadgroups = (n + decode_rows - 1) // decode_rows
         decode(y, x, weight.data, threads=[threadgroups * decode_tg, 1, 1], group_size=[decode_tg, 1, 1])
@@ -118,15 +133,16 @@ def get_quant_linear_kernels() -> QuantLinearKernels:
 class FusedLayerKernels:
     lib: object
 
-    def gdn_in_proj_decode(self, x: torch.Tensor, w_qkv: Any, w_z: Any, w_b: Any, w_a: Any) -> tuple[torch.Tensor, ...]:
-        lead = x.shape[:-1]
-        yq = torch.empty((*lead, 8192), dtype=x.dtype, device=x.device)
-        yz = torch.empty((*lead, 4096), dtype=x.dtype, device=x.device)
-        yb = torch.empty((*lead, 32), dtype=x.dtype, device=x.device)
-        ya = torch.empty_like(yb)
-        self.lib.gdn_in_proj_decode(yq, yz, yb, ya, x, w_qkv.data, w_z.data, w_b.data, w_a.data,
-                                    threads=[((12352 + 3) // 4) * 128, 1, 1], group_size=[128, 1, 1])
-        return yq, yz, yb, ya
+    def mlp_gate_up(self, x: torch.Tensor, gate_weight: Any, up_weight: Any) -> torch.Tensor:
+        seq_len = x.shape[1]
+        x2 = x.reshape(seq_len, MLP_HIDDEN_SIZE).contiguous()
+        y2 = torch.empty((seq_len, MLP_INTERMEDIATE_SIZE), dtype=x.dtype, device=x.device)
+        kernel = getattr(self.lib, MLP_GATE_UP_KERNELS[(gate_weight.type_name, up_weight.type_name)])
+        threadgroups = MLP_INTERMEDIATE_SIZE // MLP_GATE_UP_ROWS
+        kernel(y2, x2, gate_weight.data, up_weight.data, seq_len,
+               threads=[threadgroups * MLP_GATE_UP_TG, seq_len, 1],
+               group_size=[MLP_GATE_UP_TG, 1, 1])
+        return y2.reshape(*x.shape[:-1], MLP_INTERMEDIATE_SIZE)
 
     def causal_conv_silu(self, x: torch.Tensor, weight: torch.Tensor,
                          prev_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:

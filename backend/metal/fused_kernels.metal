@@ -3,6 +3,12 @@ using namespace metal;
 
 constant uint GDN_C = 8192;
 constant uint GDN_D = 128;
+constant uint MLP_K = 4096;
+constant uint MLP_N = 12288;
+constant uint MLP_NSIMD = 16;
+
+constant float iq4nl[16] = {-127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+                              1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  89.0f, 113.0f};
 
 static inline half h16(device const uchar* p) {
     ushort v = ushort(p[0]) | (ushort(p[1]) << 8);
@@ -18,9 +24,27 @@ static inline void scale_min_k4(uint j, device const uchar* q, thread uchar& d, 
     }
 }
 
+static inline void q4k_decode_block(thread float& acc, device const half* x, device const uchar* w,
+                                    uint k0, uint kb, uint row, uint simd_lane, uint K) {
+    long o = long(row) * (K / 256) * 144 + kb * 144;
+    float d = float(h16(w + o)), dm = float(h16(w + o + 2));
+    uchar sc, mn, q = w[o + 16 + simd_lane];
+    scale_min_k4(0, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane]), d * float(sc) * float(q & 15) - dm * float(mn), acc);
+    scale_min_k4(1, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 32]), d * float(sc) * float(q >> 4) - dm * float(mn), acc);
+    q = w[o + 48 + simd_lane];
+    scale_min_k4(2, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 64]), d * float(sc) * float(q & 15) - dm * float(mn), acc);
+    scale_min_k4(3, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 96]), d * float(sc) * float(q >> 4) - dm * float(mn), acc);
+    q = w[o + 80 + simd_lane];
+    scale_min_k4(4, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 128]), d * float(sc) * float(q & 15) - dm * float(mn), acc);
+    scale_min_k4(5, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 160]), d * float(sc) * float(q >> 4) - dm * float(mn), acc);
+    q = w[o + 112 + simd_lane];
+    scale_min_k4(6, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 192]), d * float(sc) * float(q & 15) - dm * float(mn), acc);
+    scale_min_k4(7, w + o + 4, sc, mn); acc = fma(float(x[k0 + simd_lane + 224]), d * float(sc) * float(q >> 4) - dm * float(mn), acc);
+}
+
 static inline void q5k_decode_block(thread float& acc, device const half* x, device const uchar* w,
-                                    uint k0, uint kb, uint row, uint simd_lane) {
-    long o = long(row) * 16 * 176 + kb * 176;
+                                    uint k0, uint kb, uint row, uint simd_lane, uint K) {
+    long o = long(row) * (K / 256) * 176 + kb * 176;
     float d = float(h16(w + o)), dm = float(h16(w + o + 2));
     uchar hm = w[o + 16 + simd_lane];
     for (uint t = 0; t < 4; ++t) {
@@ -33,44 +57,51 @@ static inline void q5k_decode_block(thread float& acc, device const half* x, dev
     }
 }
 
+static inline void iq4xs_decode_block(thread float& acc, device const half* x, device const uchar* w,
+                                      uint k0, uint kb, uint row, uint simd_lane, uint K) {
+    long o = long(row) * (K / 256) * 136 + kb * 136;
+    float d = float(h16(w + o));
+    ushort sh = ushort(w[o + 2]) | (ushort(w[o + 3]) << 8);
+    for (uint j = 0; j < 8; ++j) {
+        uint r = j * 32 + simd_lane, qj = j * 16 + (simd_lane & 15);
+        int ls = int((w[o + 4 + (j >> 1)] >> (4 * (j & 1))) & 15) | int(((sh >> (2 * j)) & 3) << 4);
+        uchar q = w[o + 8 + qj], v = (simd_lane & 16) ? (q >> 4) : (q & 15);
+        acc = fma(float(x[k0 + r]), d * float(ls - 32) * iq4nl[v], acc);
+    }
+}
+
 static inline half gdn_load_context(device const half* x, device const half* prev, long b, long c, long L,
                                     long pos, bool has_prev) {
     if (has_prev) return pos < 4 ? prev[(b * GDN_C + c) * 4 + pos] : x[(b * L + pos - 4) * GDN_C + c];
     return pos < 0 || pos >= L ? half(0.0) : x[(b * L + pos) * GDN_C + c];
 }
 
-static inline void gdn_store_half(device half* yq, device half* yz, device half* yb, device half* ya,
-                                  uint row, half v) {
-    if (row < 8192) yq[row] = v;
-    else if (row < 12288) yz[row - 8192] = v;
-    else if (row < 12320) yb[row - 12288] = v;
-    else ya[row - 12320] = v;
+#define MLP_GATE_UP_DECODE(name, decode_block) \
+[[max_total_threads_per_threadgroup(512)]] \
+kernel void name(device half* y [[buffer(0)]], device const half* x [[buffer(1)]], \
+                 device const uchar* wg [[buffer(2)]], device const uchar* wu [[buffer(3)]], \
+                 constant long& S [[buffer(4)]], uint simd_lane [[thread_index_in_simdgroup]], \
+                 uint simd_group [[simdgroup_index_in_threadgroup]], \
+                 uint3 group [[threadgroup_position_in_grid]]) { \
+    uint row = group.x * MLP_NSIMD + simd_group; \
+    long s = long(group.y); \
+    float gate = 0.0f, up = 0.0f; \
+    device const half* xr = x + s * MLP_K; \
+    for (uint kb = 0; kb < MLP_K / 256; ++kb) { \
+        uint k0 = kb * 256; \
+        decode_block(gate, xr, wg, k0, kb, row, simd_lane, MLP_K); \
+        decode_block(up, xr, wu, k0, kb, row, simd_lane, MLP_K); \
+    } \
+    gate = simd_sum(gate); up = simd_sum(up); \
+    if (s < S && row < MLP_N && simd_lane == 0) { \
+        float gh = float(half(gate)), uh = float(half(up)); \
+        y[s * MLP_N + row] = half((gh / (1.0f + exp(-gh))) * uh); \
+    } \
 }
 
-[[max_total_threads_per_threadgroup(128)]]
-kernel void gdn_in_proj_decode(device half* yq [[buffer(0)]], device half* yz [[buffer(1)]],
-                               device half* yb [[buffer(2)]], device half* ya [[buffer(3)]],
-                               device const half* x [[buffer(4)]], device const uchar* wq [[buffer(5)]],
-                               device const uchar* wz [[buffer(6)]], device const half* wb [[buffer(7)]],
-                               device const half* wa [[buffer(8)]],
-                               uint simd_lane [[thread_index_in_simdgroup]],
-                               uint simd_group [[simdgroup_index_in_threadgroup]],
-                               uint3 group [[threadgroup_position_in_grid]]) {
-    uint row = group.x * 4 + simd_group;
-    if (row >= 12352) return;
-    float acc = 0.0f;
-    if (row < 12288) {
-        device const uchar* w = row < 8192 ? wq : wz;
-        uint local = row < 8192 ? row : row - 8192;
-        for (uint kb = 0; kb < 16; ++kb) q5k_decode_block(acc, x, w, kb * 256, kb, local, simd_lane);
-    } else {
-        device const half* w = row < 12320 ? wb : wa;
-        uint local = row < 12320 ? row - 12288 : row - 12320;
-        for (uint k = simd_lane; k < 4096; k += 32) acc = fma(float(x[k]), float(w[local * 4096 + k]), acc);
-    }
-    acc = simd_sum(acc);
-    if (simd_lane == 0) gdn_store_half(yq, yz, yb, ya, row, half(acc));
-}
+MLP_GATE_UP_DECODE(mlp_gate_up_q4_k_decode, q4k_decode_block)
+MLP_GATE_UP_DECODE(mlp_gate_up_q5_k_decode, q5k_decode_block)
+MLP_GATE_UP_DECODE(mlp_gate_up_iq4_xs_decode, iq4xs_decode_block)
 
 [[max_total_threads_per_threadgroup(256)]]
 kernel void gdn_causal_conv_silu(device half* y [[buffer(0)]], device half* state [[buffer(1)]],

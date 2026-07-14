@@ -22,6 +22,9 @@ Your workflow has to be:
 
 
 # List of optimizations
+## General
+- Doing `simdgroup_load(transpose=true, ...)` gives us a free transpose operation, instead of doing it on the pytorch side.
+
 ## Prefill Kernels
 - Specialize hot kernels around fixed chunk/tile shapes so loop bounds, launch geometry, and SRAM layouts are compile-time constants.
 - Use `simd_shuffle_up` for associative intra-SIMD prefix scans, e.g. cumulative decay/gating products.
@@ -32,6 +35,7 @@ Your workflow has to be:
 ## Decode Kernels
 - Unroll loops.
 - Use threadgroup memory as much as possible.
+- Fuse kernels to increase arithmetic intensity of decode kernels..
 
 
 
