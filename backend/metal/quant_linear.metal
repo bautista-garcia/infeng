@@ -148,166 +148,249 @@ kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buff
 
 // DECODE KERNELS
 
-static inline __attribute__((always_inline)) void q4k_row_fma(thread float& acc, float xv, device const uchar* sc_base, float d, float dm, uchar q, uint j) {
-    uchar sc, mn; scale_min_k4(j, sc_base, sc, mn);
-    acc = fma(xv, d * float(sc) * float(q) - dm * float(mn), acc);
+template<uint K, uint N>
+[[max_total_threads_per_threadgroup(64)]]
+kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
+                             device const uchar* weights [[buffer(2)]],
+                             ushort lane [[thread_index_in_simdgroup]],
+                             ushort simd_group [[simdgroup_index_in_threadgroup]],
+                             uint3 group [[threadgroup_position_in_grid]]) {
+    constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    ushort ix = lane / 8, it = lane % 8, iq = it / 4, ir = it % 4;
+    uint nb = K / 256, first_row = (group.x * 2 + simd_group) * 2;
+    float yl[16], yh[16], sumf[2] = {0.0f, 0.0f};
+    device const half* src4 = src + ix * 256 + 64 * iq + 8 * ir;
+
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float4 sumy = 0.0f;
+        for (ushort i = 0; i < 8; ++i) {
+            yl[i] = float(src4[i]);       sumy[0] += yl[i];
+            yl[i + 8] = float(src4[i + 32]);  sumy[1] += yl[i + 8];
+            yh[i] = float(src4[i + 128]);     sumy[2] += yh[i];
+            yh[i + 8] = float(src4[i + 160]); sumy[3] += yh[i + 8];
+        }
+
+        for (ushort row = 0; row < 2; ++row) {
+            long o = long(first_row + row) * nb * 144 + ib * 144;
+            device const ushort* sc = reinterpret_cast<device const ushort*>(weights + o + 4) + iq;
+            device const ushort* q1 = reinterpret_cast<device const ushort*>(weights + o + 16) + 16 * iq + 4 * ir;
+            device const ushort* q2 = q1 + 32;
+            device const half* dh = reinterpret_cast<device const half*>(weights + o);
+            ushort sc16[4];
+            thread const uchar* sc8 = reinterpret_cast<thread const uchar*>(sc16);
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = (sc[4] & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            float4 acc1 = 0.0f, acc2 = 0.0f;
+            for (ushort i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i] * float(q1[i] & 0x000f);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0f00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00f0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xf000);
+                acc2[0] += yh[2 * i] * float(q2[i] & 0x000f);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0f00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00f0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xf000);
+            }
+            sumf[row] += float(dh[0]) * ((acc1[0] + acc1[1] / 256.0f) * sc8[0] +
+                                         (acc1[2] + acc1[3] / 256.0f) * sc8[1] / 16.0f +
+                                         (acc2[0] + acc2[1] / 256.0f) * sc8[4] +
+                                         (acc2[2] + acc2[3] / 256.0f) * sc8[5] / 16.0f) -
+                         float(dh[1]) * dot(sumy, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
+        }
+        src4 += 4 * 256;
+    }
+
+    for (ushort row = 0; row < 2; ++row) {
+        float sum = simd_sum(sumf[row]);
+        if (lane == 0 && first_row + row < N) dst[first_row + row] = half(sum);
+    }
 }
 
-template<uint N_ROWS>
-static inline __attribute__((always_inline)) void decode_block(q4k_tag, thread float& acc0, thread float& acc1,
-                                                               device const half* x, device const uchar* w, uint k0,
-                                                               uint kb, uint row, uint simd_lane, uint K) {
-    long stride = long(K / 256) * 144;
-    long o0 = long(row) * stride + kb * 144, o1 = o0;
-    if (N_ROWS == 2) o1 = long(row + 1) * stride + kb * 144;
-    float d0 = float(h16(w + o0)), dm0 = float(h16(w + o0 + 2));
-    float d1 = d0, dm1 = dm0;
-    if (N_ROWS == 2) { d1 = float(h16(w + o1)); dm1 = float(h16(w + o1 + 2)); }
-    device const uchar* sc0 = w + o0 + 4;
-    device const uchar* sc1 = w + o1 + 4;
-    uchar q0 = w[o0 + 16 + simd_lane], q1 = q0;
-    if (N_ROWS == 2) q1 = w[o1 + 16 + simd_lane];
-    float xv = float(x[k0 + simd_lane]); q4k_row_fma(acc0, xv, sc0, d0, dm0, q0 & 15, 0); if (N_ROWS == 2) q4k_row_fma(acc1, xv, sc1, d1, dm1, q1 & 15, 0);
-    xv = float(x[k0 + simd_lane + 32]); q4k_row_fma(acc0, xv, sc0, d0, dm0, q0 >> 4, 1); if (N_ROWS == 2) q4k_row_fma(acc1, xv, sc1, d1, dm1, q1 >> 4, 1);
-    q0 = w[o0 + 48 + simd_lane]; q1 = q0;
-    if (N_ROWS == 2) q1 = w[o1 + 48 + simd_lane];
-    xv = float(x[k0 + simd_lane + 64]); q4k_row_fma(acc0, xv, sc0, d0, dm0, q0 & 15, 2); if (N_ROWS == 2) q4k_row_fma(acc1, xv, sc1, d1, dm1, q1 & 15, 2);
-    xv = float(x[k0 + simd_lane + 96]); q4k_row_fma(acc0, xv, sc0, d0, dm0, q0 >> 4, 3); if (N_ROWS == 2) q4k_row_fma(acc1, xv, sc1, d1, dm1, q1 >> 4, 3);
-    q0 = w[o0 + 80 + simd_lane]; q1 = q0;
-    if (N_ROWS == 2) q1 = w[o1 + 80 + simd_lane];
-    xv = float(x[k0 + simd_lane + 128]); q4k_row_fma(acc0, xv, sc0, d0, dm0, q0 & 15, 4); if (N_ROWS == 2) q4k_row_fma(acc1, xv, sc1, d1, dm1, q1 & 15, 4);
-    xv = float(x[k0 + simd_lane + 160]); q4k_row_fma(acc0, xv, sc0, d0, dm0, q0 >> 4, 5); if (N_ROWS == 2) q4k_row_fma(acc1, xv, sc1, d1, dm1, q1 >> 4, 5);
-    q0 = w[o0 + 112 + simd_lane]; q1 = q0;
-    if (N_ROWS == 2) q1 = w[o1 + 112 + simd_lane];
-    xv = float(x[k0 + simd_lane + 192]); q4k_row_fma(acc0, xv, sc0, d0, dm0, q0 & 15, 6); if (N_ROWS == 2) q4k_row_fma(acc1, xv, sc1, d1, dm1, q1 & 15, 6);
-    xv = float(x[k0 + simd_lane + 224]); q4k_row_fma(acc0, xv, sc0, d0, dm0, q0 >> 4, 7); if (N_ROWS == 2) q4k_row_fma(acc1, xv, sc1, d1, dm1, q1 >> 4, 7);
+template<uint K, uint N>
+[[max_total_threads_per_threadgroup(64)]]
+kernel void decode_q5k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
+                             device const uchar* weights [[buffer(2)]],
+                             ushort lane [[thread_index_in_simdgroup]],
+                             ushort simd_group [[simdgroup_index_in_threadgroup]],
+                             uint3 group [[threadgroup_position_in_grid]]) {
+    constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    uint nb = K / 256, row = group.x * 2 + simd_group;
+    ushort tid = lane / 4, ix = lane % 4, iq = tid / 4, ir = tid % 4, l0 = 8 * ir;
+    ushort q_offset = 32 * iq + l0, y_offset = 64 * iq + l0;
+    uchar hm1 = 1u << (2 * iq), hm2 = hm1 << 1, hm3 = hm1 << 4, hm4 = hm2 << 4;
+    float yl[16], yh[16], sumf = 0.0f;
+    device const half* src1 = src + ix * 256 + y_offset;
+
+    for (uint ib = ix; ib < nb; ib += 4) {
+        device const half* src2 = src1 + 128;
+        float4 sumy = 0.0f;
+        for (ushort l = 0; l < 8; ++l) {
+            yl[l] = float(src1[l]);      sumy[0] += yl[l];
+            yl[l + 8] = float(src1[l + 32]); sumy[1] += yl[l + 8];
+            yh[l] = float(src2[l]);      sumy[2] += yh[l];
+            yh[l + 8] = float(src2[l + 32]); sumy[3] += yh[l + 8];
+        }
+        long o = long(row) * nb * 176 + ib * 176;
+        device const uchar* q1 = weights + o + 48 + q_offset;
+        device const uchar* q2 = q1 + 64;
+        device const uchar* qh = weights + o + 16 + l0;
+        device const ushort* sc = reinterpret_cast<device const ushort*>(weights + o + 4) + iq;
+        device const half* dh = reinterpret_cast<device const half*>(weights + o);
+        ushort sc16[4];
+        thread const uchar* sc8 = reinterpret_cast<thread const uchar*>(sc16);
+        sc16[0] = sc[0] & kmask1;
+        sc16[1] = sc[2] & kmask1;
+        sc16[2] = (sc[4] & kmask2) | ((sc[0] & kmask3) >> 2);
+        sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+        float4 acc1 = 0.0f, acc2 = 0.0f;
+        for (ushort l = 0; l < 8; ++l) {
+            uchar h = qh[l];
+            acc1[0] += yl[l] * float(q1[l] & 0x0f);
+            acc1[1] += yl[l + 8] * float(q1[l] & 0xf0);
+            acc1[2] += yh[l] * float(q2[l] & 0x0f);
+            acc1[3] += yh[l + 8] * float(q2[l] & 0xf0);
+            acc2[0] += h & hm1 ? yl[l] : 0.0f;
+            acc2[1] += h & hm2 ? yl[l + 8] : 0.0f;
+            acc2[2] += h & hm3 ? yh[l] : 0.0f;
+            acc2[3] += h & hm4 ? yh[l + 8] : 0.0f;
+        }
+        sumf += float(dh[0]) * (sc8[0] * (acc1[0] + 16.0f * acc2[0]) +
+                                sc8[1] * (acc1[1] / 16.0f + 16.0f * acc2[1]) +
+                                sc8[4] * (acc1[2] + 16.0f * acc2[2]) +
+                                sc8[5] * (acc1[3] / 16.0f + 16.0f * acc2[3])) -
+                float(dh[1]) * dot(sumy, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
+        src1 += 4 * 256;
+    }
+    float sum = simd_sum(sumf);
+    if (lane == 0 && row < N) dst[row] = half(sum);
 }
 
-static inline __attribute__((always_inline)) void q5k_row_fma(thread float& acc, float xv, device const uchar* sc_base, float d, float dm, uchar hm, uchar q, uint j) {
-    uchar sc, mn; scale_min_k4(j, sc_base, sc, mn);
-    acc = fma(xv, d * float(sc) * float(q + ((hm & (1 << j)) ? 16 : 0)) - dm * float(mn), acc);
+template<uint K, uint N>
+[[max_total_threads_per_threadgroup(64)]]
+kernel void decode_q6k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
+                             device const uchar* weights [[buffer(2)]],
+                             ushort lane [[thread_index_in_simdgroup]],
+                             ushort simd_group [[simdgroup_index_in_threadgroup]],
+                             uint3 group [[threadgroup_position_in_grid]]) {
+    uint nb = K / 256, first_row = (group.x * 2 + simd_group) * 2;
+    ushort tid = lane / 2, ix = lane % 2, ip = tid / 8, il = tid % 8, l0 = 4 * il;
+    ushort is = 8 * ip + l0 / 16, y_offset = 128 * ip + l0;
+    ushort q_offset_l = 64 * ip + l0, q_offset_h = 32 * ip + l0;
+    float yl[16], sumf[2] = {0.0f, 0.0f};
+
+    for (uint ib = ix; ib < nb; ib += 2) {
+        device const half* y = src + ib * 256 + y_offset;
+        for (ushort l = 0; l < 4; ++l) {
+            yl[4 * l] = float(y[l]); yl[4 * l + 1] = float(y[l + 32]);
+            yl[4 * l + 2] = float(y[l + 64]); yl[4 * l + 3] = float(y[l + 96]);
+        }
+        for (ushort row = 0; row < 2; ++row) {
+            long o = long(first_row + row) * nb * 210 + ib * 210;
+            device const uchar* q1 = weights + o + q_offset_l;
+            device const uchar* q2 = q1 + 32;
+            device const uchar* qh = weights + o + 128 + q_offset_h;
+            device const char* sc = reinterpret_cast<device const char*>(weights + o + 192 + is);
+            float4 sums = 0.0f;
+            for (ushort l = 0; l < 4; ++l) {
+                sums[0] += yl[4 * l] * (float((q1[l] & 15) | ((qh[l] & 0x03) << 4)) - 32.0f);
+                sums[1] += yl[4 * l + 1] * (float((q2[l] & 15) | ((qh[l] & 0x0c) << 2)) - 32.0f);
+                sums[2] += yl[4 * l + 2] * (float((q1[l] >> 4) | (qh[l] & 0x30)) - 32.0f);
+                sums[3] += yl[4 * l + 3] * (float((q2[l] >> 4) | ((qh[l] & 0xc0) >> 2)) - 32.0f);
+            }
+            float d = float(*reinterpret_cast<device const half*>(weights + o + 208));
+            sumf[row] += d * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        }
+    }
+    for (ushort row = 0; row < 2; ++row) {
+        float sum = simd_sum(sumf[row]);
+        if (lane == 0 && first_row + row < N) dst[first_row + row] = half(sum);
+    }
 }
 
-template<uint N_ROWS>
-static inline __attribute__((always_inline)) void decode_block(q5k_tag, thread float& acc0, thread float& acc1,
-                                                               device const half* x, device const uchar* w, uint k0,
-                                                               uint kb, uint row, uint simd_lane, uint K) {
-    long stride = long(K / 256) * 176;
-    long o0 = long(row) * stride + kb * 176, o1 = o0;
-    if (N_ROWS == 2) o1 = long(row + 1) * stride + kb * 176;
-    float d0 = float(h16(w + o0)), dm0 = float(h16(w + o0 + 2));
-    float d1 = d0, dm1 = dm0;
-    if (N_ROWS == 2) { d1 = float(h16(w + o1)); dm1 = float(h16(w + o1 + 2)); }
-    uchar hm0 = w[o0 + 16 + simd_lane], hm1 = hm0;
-    if (N_ROWS == 2) hm1 = w[o1 + 16 + simd_lane];
-    device const uchar* sc0 = w + o0 + 4;
-    device const uchar* sc1 = w + o1 + 4;
-    uchar q0 = w[o0 + 48 + simd_lane], q1 = q0;
-    if (N_ROWS == 2) q1 = w[o1 + 48 + simd_lane];
-    float xv = float(x[k0 + simd_lane]); q5k_row_fma(acc0, xv, sc0, d0, dm0, hm0, q0 & 15, 0); if (N_ROWS == 2) q5k_row_fma(acc1, xv, sc1, d1, dm1, hm1, q1 & 15, 0);
-    xv = float(x[k0 + simd_lane + 32]); q5k_row_fma(acc0, xv, sc0, d0, dm0, hm0, q0 >> 4, 1); if (N_ROWS == 2) q5k_row_fma(acc1, xv, sc1, d1, dm1, hm1, q1 >> 4, 1);
-    q0 = w[o0 + 80 + simd_lane]; q1 = q0;
-    if (N_ROWS == 2) q1 = w[o1 + 80 + simd_lane];
-    xv = float(x[k0 + simd_lane + 64]); q5k_row_fma(acc0, xv, sc0, d0, dm0, hm0, q0 & 15, 2); if (N_ROWS == 2) q5k_row_fma(acc1, xv, sc1, d1, dm1, hm1, q1 & 15, 2);
-    xv = float(x[k0 + simd_lane + 96]); q5k_row_fma(acc0, xv, sc0, d0, dm0, hm0, q0 >> 4, 3); if (N_ROWS == 2) q5k_row_fma(acc1, xv, sc1, d1, dm1, hm1, q1 >> 4, 3);
-    q0 = w[o0 + 112 + simd_lane]; q1 = q0;
-    if (N_ROWS == 2) q1 = w[o1 + 112 + simd_lane];
-    xv = float(x[k0 + simd_lane + 128]); q5k_row_fma(acc0, xv, sc0, d0, dm0, hm0, q0 & 15, 4); if (N_ROWS == 2) q5k_row_fma(acc1, xv, sc1, d1, dm1, hm1, q1 & 15, 4);
-    xv = float(x[k0 + simd_lane + 160]); q5k_row_fma(acc0, xv, sc0, d0, dm0, hm0, q0 >> 4, 5); if (N_ROWS == 2) q5k_row_fma(acc1, xv, sc1, d1, dm1, hm1, q1 >> 4, 5);
-    q0 = w[o0 + 144 + simd_lane]; q1 = q0;
-    if (N_ROWS == 2) q1 = w[o1 + 144 + simd_lane];
-    xv = float(x[k0 + simd_lane + 192]); q5k_row_fma(acc0, xv, sc0, d0, dm0, hm0, q0 & 15, 6); if (N_ROWS == 2) q5k_row_fma(acc1, xv, sc1, d1, dm1, hm1, q1 & 15, 6);
-    xv = float(x[k0 + simd_lane + 224]); q5k_row_fma(acc0, xv, sc0, d0, dm0, hm0, q0 >> 4, 7); if (N_ROWS == 2) q5k_row_fma(acc1, xv, sc1, d1, dm1, hm1, q1 >> 4, 7);
+template<uint K, uint N>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void decode_q8_0(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
+                              device const uchar* weights [[buffer(2)]],
+                              ushort lane [[thread_index_in_simdgroup]],
+                              ushort simd_group [[simdgroup_index_in_threadgroup]],
+                              uint3 group [[threadgroup_position_in_grid]]) {
+    uint nb = K / 32, first_row = group.x * 2;
+    ushort ix = lane / 4, il = lane % 4;
+    uint ib0 = simd_group * 8 + ix;
+    float yl[8], sumf[2] = {0.0f, 0.0f};
+    device const half* y = src + ib0 * 32 + il * 8;
+    threadgroup float partial[8];
+    for (uint ib = ib0; ib < nb; ib += 32) {
+        for (ushort i = 0; i < 8; ++i) yl[i] = float(y[i]);
+        for (ushort row = 0; row < 2; ++row) {
+            long o = long(first_row + row) * nb * 34 + ib * 34;
+            device const char* qs = reinterpret_cast<device const char*>(weights + o + 2 + il * 8);
+            float sumq = 0.0f;
+            for (ushort i = 0; i < 8; ++i) sumq += float(qs[i]) * yl[i];
+            sumf[row] += sumq * float(*reinterpret_cast<device const half*>(weights + o));
+        }
+        y += 32 * 32;
+    }
+    for (ushort row = 0; row < 2; ++row) {
+        float sum = simd_sum(sumf[row]);
+        if (lane == 0) partial[simd_group * 2 + row] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0 && lane == 0) {
+        for (ushort row = 0; row < 2; ++row) {
+            float sum = partial[row] + partial[2 + row] + partial[4 + row] + partial[6 + row];
+            if (first_row + row < N) dst[first_row + row] = half(sum);
+        }
+    }
 }
 
-template<uint N_ROWS>
-static inline __attribute__((always_inline)) void decode_block(q6k_tag, thread float& acc0, thread float& acc1,
-                                                               device const half* x, device const uchar* w, uint k0,
-                                                               uint kb, uint row, uint simd_lane, uint K) {
-    uint l = simd_lane;
-    long stride = long(K / 256) * 210;
-    long o0 = long(row) * stride + kb * 210, o1 = o0;
-    if (N_ROWS == 2) o1 = long(row + 1) * stride + kb * 210;
-    float d0 = float(h16(w + o0 + 208)), d1 = d0;
-    if (N_ROWS == 2) d1 = float(h16(w + o1 + 208));
-    uint rr = l, qlo = l; uchar q = w[o0 + qlo], lo = q & 15, hi = w[o0 + 128 + l] & 3; char sc = char(w[o0 + 192 + (rr >> 4)]); float xv = float(x[k0 + rr]);
-    acc0 = fma(xv, d0 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc0); if (N_ROWS == 2) { q = w[o1 + qlo]; lo = q & 15; hi = w[o1 + 128 + l] & 3; sc = char(w[o1 + 192 + (rr >> 4)]); acc1 = fma(xv, d1 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc1); }
-    rr = 32 + l; qlo = 32 + l; q = w[o0 + qlo]; lo = q & 15; hi = (w[o0 + 128 + l] >> 2) & 3; sc = char(w[o0 + 192 + (rr >> 4)]); xv = float(x[k0 + rr]);
-    acc0 = fma(xv, d0 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc0); if (N_ROWS == 2) { q = w[o1 + qlo]; lo = q & 15; hi = (w[o1 + 128 + l] >> 2) & 3; sc = char(w[o1 + 192 + (rr >> 4)]); acc1 = fma(xv, d1 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc1); }
-    rr = 64 + l; qlo = l; q = w[o0 + qlo]; lo = q >> 4; hi = (w[o0 + 128 + l] >> 4) & 3; sc = char(w[o0 + 192 + (rr >> 4)]); xv = float(x[k0 + rr]);
-    acc0 = fma(xv, d0 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc0); if (N_ROWS == 2) { q = w[o1 + qlo]; lo = q >> 4; hi = (w[o1 + 128 + l] >> 4) & 3; sc = char(w[o1 + 192 + (rr >> 4)]); acc1 = fma(xv, d1 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc1); }
-    rr = 96 + l; qlo = 32 + l; q = w[o0 + qlo]; lo = q >> 4; hi = (w[o0 + 128 + l] >> 6) & 3; sc = char(w[o0 + 192 + (rr >> 4)]); xv = float(x[k0 + rr]);
-    acc0 = fma(xv, d0 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc0); if (N_ROWS == 2) { q = w[o1 + qlo]; lo = q >> 4; hi = (w[o1 + 128 + l] >> 6) & 3; sc = char(w[o1 + 192 + (rr >> 4)]); acc1 = fma(xv, d1 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc1); }
-    rr = l; qlo = 64 + l; q = w[o0 + qlo]; lo = q & 15; hi = w[o0 + 160 + l] & 3; sc = char(w[o0 + 200 + (rr >> 4)]); xv = float(x[k0 + 128 + rr]);
-    acc0 = fma(xv, d0 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc0); if (N_ROWS == 2) { q = w[o1 + qlo]; lo = q & 15; hi = w[o1 + 160 + l] & 3; sc = char(w[o1 + 200 + (rr >> 4)]); acc1 = fma(xv, d1 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc1); }
-    rr = 32 + l; qlo = 96 + l; q = w[o0 + qlo]; lo = q & 15; hi = (w[o0 + 160 + l] >> 2) & 3; sc = char(w[o0 + 200 + (rr >> 4)]); xv = float(x[k0 + 128 + rr]);
-    acc0 = fma(xv, d0 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc0); if (N_ROWS == 2) { q = w[o1 + qlo]; lo = q & 15; hi = (w[o1 + 160 + l] >> 2) & 3; sc = char(w[o1 + 200 + (rr >> 4)]); acc1 = fma(xv, d1 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc1); }
-    rr = 64 + l; qlo = 64 + l; q = w[o0 + qlo]; lo = q >> 4; hi = (w[o0 + 160 + l] >> 4) & 3; sc = char(w[o0 + 200 + (rr >> 4)]); xv = float(x[k0 + 128 + rr]);
-    acc0 = fma(xv, d0 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc0); if (N_ROWS == 2) { q = w[o1 + qlo]; lo = q >> 4; hi = (w[o1 + 160 + l] >> 4) & 3; sc = char(w[o1 + 200 + (rr >> 4)]); acc1 = fma(xv, d1 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc1); }
-    rr = 96 + l; qlo = 96 + l; q = w[o0 + qlo]; lo = q >> 4; hi = (w[o0 + 160 + l] >> 6) & 3; sc = char(w[o0 + 200 + (rr >> 4)]); xv = float(x[k0 + 128 + rr]);
-    acc0 = fma(xv, d0 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc0); if (N_ROWS == 2) { q = w[o1 + qlo]; lo = q >> 4; hi = (w[o1 + 160 + l] >> 6) & 3; sc = char(w[o1 + 200 + (rr >> 4)]); acc1 = fma(xv, d1 * float(sc) * (float((hi << 4) | lo) - 32.0f), acc1); }
-}
-
-template<uint N_ROWS>
-static inline __attribute__((always_inline)) void decode_block(q8_0_tag, thread float& acc0, thread float& acc1,
-                                                               device const half* x, device const uchar* w, uint k0,
-                                                               uint kb, uint row, uint simd_lane, uint K) {
-    long stride = long(K / 32) * 34;
-    long base0 = long(row) * stride + kb * 8 * 34;
-    long base1 = base0;
-    if (N_ROWS == 2) base1 = long(row + 1) * stride + kb * 8 * 34;
-    float xv = float(x[k0 + simd_lane]); acc0 = fma(xv, float(h16(w + base0)) * float(char(w[base0 + 2 + simd_lane])), acc0); if (N_ROWS == 2) acc1 = fma(xv, float(h16(w + base1)) * float(char(w[base1 + 2 + simd_lane])), acc1);
-    xv = float(x[k0 + 32 + simd_lane]); acc0 = fma(xv, float(h16(w + base0 + 34)) * float(char(w[base0 + 36 + simd_lane])), acc0); if (N_ROWS == 2) acc1 = fma(xv, float(h16(w + base1 + 34)) * float(char(w[base1 + 36 + simd_lane])), acc1);
-    xv = float(x[k0 + 64 + simd_lane]); acc0 = fma(xv, float(h16(w + base0 + 68)) * float(char(w[base0 + 70 + simd_lane])), acc0); if (N_ROWS == 2) acc1 = fma(xv, float(h16(w + base1 + 68)) * float(char(w[base1 + 70 + simd_lane])), acc1);
-    xv = float(x[k0 + 96 + simd_lane]); acc0 = fma(xv, float(h16(w + base0 + 102)) * float(char(w[base0 + 104 + simd_lane])), acc0); if (N_ROWS == 2) acc1 = fma(xv, float(h16(w + base1 + 102)) * float(char(w[base1 + 104 + simd_lane])), acc1);
-    xv = float(x[k0 + 128 + simd_lane]); acc0 = fma(xv, float(h16(w + base0 + 136)) * float(char(w[base0 + 138 + simd_lane])), acc0); if (N_ROWS == 2) acc1 = fma(xv, float(h16(w + base1 + 136)) * float(char(w[base1 + 138 + simd_lane])), acc1);
-    xv = float(x[k0 + 160 + simd_lane]); acc0 = fma(xv, float(h16(w + base0 + 170)) * float(char(w[base0 + 172 + simd_lane])), acc0); if (N_ROWS == 2) acc1 = fma(xv, float(h16(w + base1 + 170)) * float(char(w[base1 + 172 + simd_lane])), acc1);
-    xv = float(x[k0 + 192 + simd_lane]); acc0 = fma(xv, float(h16(w + base0 + 204)) * float(char(w[base0 + 206 + simd_lane])), acc0); if (N_ROWS == 2) acc1 = fma(xv, float(h16(w + base1 + 204)) * float(char(w[base1 + 206 + simd_lane])), acc1);
-    xv = float(x[k0 + 224 + simd_lane]); acc0 = fma(xv, float(h16(w + base0 + 238)) * float(char(w[base0 + 240 + simd_lane])), acc0); if (N_ROWS == 2) acc1 = fma(xv, float(h16(w + base1 + 238)) * float(char(w[base1 + 240 + simd_lane])), acc1);
-}
-
-static inline __attribute__((always_inline)) void iq4xs_row_fma(thread float& acc, float xv, device const uchar* w, long o, float d, ushort sh, uint j, uint qj, uint simd_lane) {
-    int ls = int((w[o + 4 + (j >> 1)] >> (4 * (j & 1))) & 15) | int(((sh >> (2 * j)) & 3) << 4);
-    uchar q = w[o + 8 + qj], v = (simd_lane & 16) ? (q >> 4) : (q & 15);
-    acc = fma(xv, d * float(ls - 32) * iq4nl[v], acc);
-}
-
-template<uint N_ROWS>
-static inline __attribute__((always_inline)) void decode_block(iq4xs_tag, thread float& acc0, thread float& acc1,
-                                                               device const half* x, device const uchar* w, uint k0,
-                                                               uint kb, uint row, uint simd_lane, uint K) {
-    long stride = long(K / 256) * 136;
-    long o0 = long(row) * stride + kb * 136, o1 = o0;
-    if (N_ROWS == 2) o1 = long(row + 1) * stride + kb * 136;
-    float d0 = float(h16(w + o0)), d1 = d0;
-    if (N_ROWS == 2) d1 = float(h16(w + o1));
-    ushort sh0 = ushort(w[o0 + 2]) | (ushort(w[o0 + 3]) << 8);
-    ushort sh1 = sh0;
-    if (N_ROWS == 2) sh1 = ushort(w[o1 + 2]) | (ushort(w[o1 + 3]) << 8);
-    uint ql = simd_lane & 15;
-    float xv = float(x[k0 + simd_lane]); iq4xs_row_fma(acc0, xv, w, o0, d0, sh0, 0, ql, simd_lane); if (N_ROWS == 2) iq4xs_row_fma(acc1, xv, w, o1, d1, sh1, 0, ql, simd_lane);
-    xv = float(x[k0 + 32 + simd_lane]); iq4xs_row_fma(acc0, xv, w, o0, d0, sh0, 1, 16 + ql, simd_lane); if (N_ROWS == 2) iq4xs_row_fma(acc1, xv, w, o1, d1, sh1, 1, 16 + ql, simd_lane);
-    xv = float(x[k0 + 64 + simd_lane]); iq4xs_row_fma(acc0, xv, w, o0, d0, sh0, 2, 32 + ql, simd_lane); if (N_ROWS == 2) iq4xs_row_fma(acc1, xv, w, o1, d1, sh1, 2, 32 + ql, simd_lane);
-    xv = float(x[k0 + 96 + simd_lane]); iq4xs_row_fma(acc0, xv, w, o0, d0, sh0, 3, 48 + ql, simd_lane); if (N_ROWS == 2) iq4xs_row_fma(acc1, xv, w, o1, d1, sh1, 3, 48 + ql, simd_lane);
-    xv = float(x[k0 + 128 + simd_lane]); iq4xs_row_fma(acc0, xv, w, o0, d0, sh0, 4, 64 + ql, simd_lane); if (N_ROWS == 2) iq4xs_row_fma(acc1, xv, w, o1, d1, sh1, 4, 64 + ql, simd_lane);
-    xv = float(x[k0 + 160 + simd_lane]); iq4xs_row_fma(acc0, xv, w, o0, d0, sh0, 5, 80 + ql, simd_lane); if (N_ROWS == 2) iq4xs_row_fma(acc1, xv, w, o1, d1, sh1, 5, 80 + ql, simd_lane);
-    xv = float(x[k0 + 192 + simd_lane]); iq4xs_row_fma(acc0, xv, w, o0, d0, sh0, 6, 96 + ql, simd_lane); if (N_ROWS == 2) iq4xs_row_fma(acc1, xv, w, o1, d1, sh1, 6, 96 + ql, simd_lane);
-    xv = float(x[k0 + 224 + simd_lane]); iq4xs_row_fma(acc0, xv, w, o0, d0, sh0, 7, 112 + ql, simd_lane); if (N_ROWS == 2) iq4xs_row_fma(acc1, xv, w, o1, d1, sh1, 7, 112 + ql, simd_lane);
-}
-
-template<typename Q, uint TG, uint NSIMD, uint N_ROWS, uint K, uint N>
-[[max_total_threads_per_threadgroup(TG)]]
-kernel void decode_qk(device half* y [[buffer(0)]], device const half* x [[buffer(1)]],
-                      device const uchar* w [[buffer(2)]], uint simd_lane [[thread_index_in_simdgroup]],
-                      uint simd_group [[simdgroup_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
-    uint row = group.x * (NSIMD * N_ROWS) + simd_group * N_ROWS;
-    float acc0 = 0.0f, acc1 = 0.0f;
-    for (uint kb = 0; kb < K / 256; ++kb) decode_block<N_ROWS>(Q(), acc0, acc1, x, w, kb * 256, kb, row, simd_lane, K);
-    acc0 = simd_sum(acc0);
-    if (N_ROWS == 2) acc1 = simd_sum(acc1);
-    if (simd_lane == 0) {
-        if (row < N) y[row] = half(acc0);
-        if (N_ROWS == 2 && row + 1 < N) y[row + 1] = half(acc1);
+template<uint K, uint N>
+[[max_total_threads_per_threadgroup(64)]]
+kernel void decode_iq4xs(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
+                               device const uchar* weights [[buffer(2)]],
+                               ushort lane [[thread_index_in_simdgroup]],
+                               ushort simd_group [[simdgroup_index_in_threadgroup]],
+                               uint3 group [[threadgroup_position_in_grid]]) {
+    uint nb = K / 256, first_row = (group.x * 2 + simd_group) * 2;
+    ushort ix = lane / 16, it = lane % 16, part = it / 2, il = it % 2;
+    threadgroup float lookup[16];
+    if (lane < 16) lookup[lane] = iq4nl[lane];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 yl[4];
+    float sumf[2] = {0.0f, 0.0f};
+    device const half* y = src + ix * 256 + part * 32 + il * 8;
+    for (uint ib = ix; ib < nb; ib += 2) {
+        yl[0] = float4(float(y[0]), float(y[1]), float(y[2]), float(y[3]));
+        yl[1] = float4(float(y[16]), float(y[17]), float(y[18]), float(y[19]));
+        yl[2] = float4(float(y[4]), float(y[5]), float(y[6]), float(y[7]));
+        yl[3] = float4(float(y[20]), float(y[21]), float(y[22]), float(y[23]));
+        for (ushort row = 0; row < 2; ++row) {
+            long o = long(first_row + row) * nb * 136 + ib * 136;
+            device const uint* q4 = reinterpret_cast<device const uint*>(weights + o + 8 + 16 * part + 8 * il);
+            uint aux[2];
+            thread const uchar* q8 = reinterpret_cast<thread const uchar*>(aux);
+            float4 acc1 = 0.0f, acc2 = 0.0f;
+            aux[0] = q4[0] & 0x0f0f0f0f; aux[1] = (q4[0] >> 4) & 0x0f0f0f0f;
+            acc1 += yl[0] * float4(lookup[q8[0]], lookup[q8[1]], lookup[q8[2]], lookup[q8[3]]);
+            acc2 += yl[1] * float4(lookup[q8[4]], lookup[q8[5]], lookup[q8[6]], lookup[q8[7]]);
+            aux[0] = q4[1] & 0x0f0f0f0f; aux[1] = (q4[1] >> 4) & 0x0f0f0f0f;
+            acc1 += yl[2] * float4(lookup[q8[0]], lookup[q8[1]], lookup[q8[2]], lookup[q8[3]]);
+            acc2 += yl[3] * float4(lookup[q8[4]], lookup[q8[5]], lookup[q8[6]], lookup[q8[7]]);
+            acc1 += acc2;
+            ushort sh = *reinterpret_cast<device const ushort*>(weights + o + 2);
+            int ls = int((weights[o + 4 + part / 2] >> (4 * (part % 2))) & 15) |
+                     int(((sh >> (2 * part)) & 3) << 4);
+            float d = float(*reinterpret_cast<device const half*>(weights + o));
+            sumf[row] += d * float(ls - 32) * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+        }
+        y += 2 * 256;
+    }
+    for (ushort row = 0; row < 2; ++row) {
+        float sum = simd_sum(sumf[row]);
+        if (lane == 0 && first_row + row < N) dst[first_row + row] = half(sum);
     }
 }
 
@@ -330,32 +413,32 @@ template [[host_name("q4_k_k4096_n4096_prefill")]] kernel void prefill_qk<q4k_ta
 template [[host_name("q4_k_k12288_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 12288, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q4_k_k4096_n8192_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 8192>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q4_k_k4096_n12288_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 12288>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q4_k_k4096_n1024_decode")]] kernel void decode_qk<q4k_tag, 256, 8, 1, 4096, 1024>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q4_k_k4096_n4096_decode_r2_tg128")]] kernel void decode_qk<q4k_tag, 128, 4, 2, 4096, 4096>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q4_k_k12288_n4096_decode_r2_tg64")]] kernel void decode_qk<q4k_tag, 64, 2, 2, 12288, 4096>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q4_k_k4096_n8192_decode_r2_tg64")]] kernel void decode_qk<q4k_tag, 64, 2, 2, 4096, 8192>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q4_k_k4096_n12288_decode_r2_tg128")]] kernel void decode_qk<q4k_tag, 128, 4, 2, 4096, 12288>(device half*, device const half*, device const uchar*, uint, uint, uint3);
+template [[host_name("q4_k_k4096_n1024_decode")]] kernel void decode_q4k<4096, 1024>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q4_k_k4096_n4096_decode")]] kernel void decode_q4k<4096, 4096>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q4_k_k12288_n4096_decode")]] kernel void decode_q4k<12288, 4096>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q4_k_k4096_n8192_decode")]] kernel void decode_q4k<4096, 8192>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q4_k_k4096_n12288_decode")]] kernel void decode_q4k<4096, 12288>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
 
 template [[host_name("q5_k_k4096_n1024_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 1024>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q5_k_k4096_n4096_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q5_k_k12288_n4096_prefill")]] kernel void prefill_qk<q5k_tag, 12288, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q5_k_k4096_n8192_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 8192>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q5_k_k4096_n12288_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 12288>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q5_k_k4096_n1024_decode_r2_tg128")]] kernel void decode_qk<q5k_tag, 128, 4, 2, 4096, 1024>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q5_k_k4096_n4096_decode_r2_tg64")]] kernel void decode_qk<q5k_tag, 64, 2, 2, 4096, 4096>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q5_k_k12288_n4096_decode_r2_tg128")]] kernel void decode_qk<q5k_tag, 128, 4, 2, 12288, 4096>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q5_k_k4096_n8192_decode_r2_tg128")]] kernel void decode_qk<q5k_tag, 128, 4, 2, 4096, 8192>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q5_k_k4096_n12288_decode_r2_tg64")]] kernel void decode_qk<q5k_tag, 64, 2, 2, 4096, 12288>(device half*, device const half*, device const uchar*, uint, uint, uint3);
+template [[host_name("q5_k_k4096_n1024_decode")]] kernel void decode_q5k<4096, 1024>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q5_k_k4096_n4096_decode")]] kernel void decode_q5k<4096, 4096>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q5_k_k12288_n4096_decode")]] kernel void decode_q5k<12288, 4096>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q5_k_k4096_n8192_decode")]] kernel void decode_q5k<4096, 8192>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q5_k_k4096_n12288_decode")]] kernel void decode_q5k<4096, 12288>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
 
 template [[host_name("q6_k_k4096_n1024_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 1024>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q6_k_k12288_n4096_prefill")]] kernel void prefill_qk<q6k_tag, 12288, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q6_k_k4096_n248320_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 248320>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q6_k_k4096_n1024_decode")]] kernel void decode_qk<q6k_tag, 256, 8, 1, 4096, 1024>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q6_k_k12288_n4096_decode")]] kernel void decode_qk<q6k_tag, 128, 4, 1, 12288, 4096>(device half*, device const half*, device const uchar*, uint, uint, uint3);
-template [[host_name("q6_k_k4096_n248320_decode")]] kernel void decode_qk<q6k_tag, 128, 4, 1, 4096, 248320>(device half*, device const half*, device const uchar*, uint, uint, uint3);
+template [[host_name("q6_k_k4096_n1024_decode")]] kernel void decode_q6k<4096, 1024>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q6_k_k12288_n4096_decode")]] kernel void decode_q6k<12288, 4096>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q6_k_k4096_n248320_decode")]] kernel void decode_q6k<4096, 248320>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
 
 template [[host_name("q8_0_k4096_n4096_prefill")]] kernel void prefill_qk<q8_0_tag, 4096, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q8_0_k4096_n4096_decode")]] kernel void decode_qk<q8_0_tag, 128, 4, 1, 4096, 4096>(device half*, device const half*, device const uchar*, uint, uint, uint3);
+template [[host_name("q8_0_k4096_n4096_decode")]] kernel void decode_q8_0<4096, 4096>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
 
 template [[host_name("iq4_xs_k4096_n12288_prefill")]] kernel void prefill_qk<iq4xs_tag, 4096, 12288>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("iq4_xs_k4096_n12288_decode")]] kernel void decode_qk<iq4xs_tag, 128, 4, 1, 4096, 12288>(device half*, device const half*, device const uchar*, uint, uint, uint3);
+template [[host_name("iq4_xs_k4096_n12288_decode")]] kernel void decode_iq4xs<4096, 12288>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);

@@ -174,7 +174,7 @@ def main():
         "--weights", default="weights/Qwen3.5-9B-UD-Q4_K_XL.gguf"
     )
     parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=10240)
     parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)

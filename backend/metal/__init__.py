@@ -14,29 +14,27 @@ _FUSED_LAYER_KERNELS: "FusedLayerKernels | None" = None
 _DELTA_PREFILL_CHUNK = 16
 MLP_HIDDEN_SIZE = 4096
 MLP_INTERMEDIATE_SIZE = 12288
-MLP_GATE_UP_TG = 512
-MLP_GATE_UP_ROWS = 16
 MLP_GATE_UP_KERNELS = {
-    ("Q4_K", "Q4_K"): "mlp_gate_up_q4_k_decode",
-    ("Q5_K", "Q5_K"): "mlp_gate_up_q5_k_decode",
-    ("IQ4_XS", "IQ4_XS"): "mlp_gate_up_iq4_xs_decode",
+    ("Q4_K", "Q4_K"): ("mlp_gate_up_q4_k_decode", 64, 4),
+    ("Q5_K", "Q5_K"): ("mlp_gate_up_q5_k_decode", 64, 2),
+    ("IQ4_XS", "IQ4_XS"): ("mlp_gate_up_iq4_xs_decode", 64, 4),
 }
 QUANT_LINEAR_KERNELS = {
-    ("Q4_K", 4096, 1024): ("q4_k_k4096_n1024_decode", "q4_k_k4096_n1024_prefill", 256, 8),
-    ("Q4_K", 4096, 4096): ("q4_k_k4096_n4096_decode_r2_tg128", "q4_k_k4096_n4096_prefill", 128, 8),
-    ("Q4_K", 4096, 8192): ("q4_k_k4096_n8192_decode_r2_tg64", "q4_k_k4096_n8192_prefill", 64, 4),
-    ("Q4_K", 4096, 12288): ("q4_k_k4096_n12288_decode_r2_tg128", "q4_k_k4096_n12288_prefill", 128, 8),
-    ("Q4_K", 12288, 4096): ("q4_k_k12288_n4096_decode_r2_tg64", "q4_k_k12288_n4096_prefill", 64, 4),
-    ("Q5_K", 4096, 1024): ("q5_k_k4096_n1024_decode_r2_tg128", "q5_k_k4096_n1024_prefill", 128, 8),
-    ("Q5_K", 4096, 4096): ("q5_k_k4096_n4096_decode_r2_tg64", "q5_k_k4096_n4096_prefill", 64, 4),
-    ("Q5_K", 4096, 8192): ("q5_k_k4096_n8192_decode_r2_tg128", "q5_k_k4096_n8192_prefill", 128, 8),
-    ("Q5_K", 4096, 12288): ("q5_k_k4096_n12288_decode_r2_tg64", "q5_k_k4096_n12288_prefill", 64, 4),
-    ("Q5_K", 12288, 4096): ("q5_k_k12288_n4096_decode_r2_tg128", "q5_k_k12288_n4096_prefill", 128, 8),
-    ("Q6_K", 4096, 1024): ("q6_k_k4096_n1024_decode", "q6_k_k4096_n1024_prefill", 256, 8),
-    ("Q6_K", 12288, 4096): ("q6_k_k12288_n4096_decode", "q6_k_k12288_n4096_prefill", 128, 4),
-    ("Q6_K", 4096, 248320): ("q6_k_k4096_n248320_decode", "q6_k_k4096_n248320_prefill", 128, 4),
-    ("Q8_0", 4096, 4096): ("q8_0_k4096_n4096_decode", "q8_0_k4096_n4096_prefill", 128, 4),
-    ("IQ4_XS", 4096, 12288): ("iq4_xs_k4096_n12288_decode", "iq4_xs_k4096_n12288_prefill", 128, 4),
+    ("Q4_K", 4096, 1024): ("q4_k_k4096_n1024_decode", "q4_k_k4096_n1024_prefill", 64, 4),
+    ("Q4_K", 4096, 4096): ("q4_k_k4096_n4096_decode", "q4_k_k4096_n4096_prefill", 64, 4),
+    ("Q4_K", 4096, 8192): ("q4_k_k4096_n8192_decode", "q4_k_k4096_n8192_prefill", 64, 4),
+    ("Q4_K", 4096, 12288): ("q4_k_k4096_n12288_decode", "q4_k_k4096_n12288_prefill", 64, 4),
+    ("Q4_K", 12288, 4096): ("q4_k_k12288_n4096_decode", "q4_k_k12288_n4096_prefill", 64, 4),
+    ("Q5_K", 4096, 1024): ("q5_k_k4096_n1024_decode", "q5_k_k4096_n1024_prefill", 64, 2),
+    ("Q5_K", 4096, 4096): ("q5_k_k4096_n4096_decode", "q5_k_k4096_n4096_prefill", 64, 2),
+    ("Q5_K", 4096, 8192): ("q5_k_k4096_n8192_decode", "q5_k_k4096_n8192_prefill", 64, 2),
+    ("Q5_K", 4096, 12288): ("q5_k_k4096_n12288_decode", "q5_k_k4096_n12288_prefill", 64, 2),
+    ("Q5_K", 12288, 4096): ("q5_k_k12288_n4096_decode", "q5_k_k12288_n4096_prefill", 64, 2),
+    ("Q6_K", 4096, 1024): ("q6_k_k4096_n1024_decode", "q6_k_k4096_n1024_prefill", 64, 4),
+    ("Q6_K", 12288, 4096): ("q6_k_k12288_n4096_decode", "q6_k_k12288_n4096_prefill", 64, 4),
+    ("Q6_K", 4096, 248320): ("q6_k_k4096_n248320_decode", "q6_k_k4096_n248320_prefill", 64, 4),
+    ("Q8_0", 4096, 4096): ("q8_0_k4096_n4096_decode", "q8_0_k4096_n4096_prefill", 128, 2),
+    ("IQ4_XS", 4096, 12288): ("iq4_xs_k4096_n12288_decode", "iq4_xs_k4096_n12288_prefill", 64, 4),
 }
 
 
@@ -137,11 +135,12 @@ class FusedLayerKernels:
         seq_len = x.shape[1]
         x2 = x.reshape(seq_len, MLP_HIDDEN_SIZE).contiguous()
         y2 = torch.empty((seq_len, MLP_INTERMEDIATE_SIZE), dtype=x.dtype, device=x.device)
-        kernel = getattr(self.lib, MLP_GATE_UP_KERNELS[(gate_weight.type_name, up_weight.type_name)])
-        threadgroups = MLP_INTERMEDIATE_SIZE // MLP_GATE_UP_ROWS
+        kernel_name, threadgroup_size, rows = MLP_GATE_UP_KERNELS[(gate_weight.type_name, up_weight.type_name)]
+        kernel = getattr(self.lib, kernel_name)
+        threadgroups = MLP_INTERMEDIATE_SIZE // rows
         kernel(y2, x2, gate_weight.data, up_weight.data, seq_len,
-               threads=[threadgroups * MLP_GATE_UP_TG, seq_len, 1],
-               group_size=[MLP_GATE_UP_TG, 1, 1])
+               threads=[threadgroups * threadgroup_size, seq_len, 1],
+               group_size=[threadgroup_size, 1, 1])
         return y2.reshape(*x.shape[:-1], MLP_INTERMEDIATE_SIZE)
 
     def causal_conv_silu(self, x: torch.Tensor, weight: torch.Tensor,
