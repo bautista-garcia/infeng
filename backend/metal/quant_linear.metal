@@ -169,8 +169,8 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
             yh[i] = float(src4[i + 128]);     sumy[2] += yh[i];
             yh[i + 8] = float(src4[i + 160]); sumy[3] += yh[i + 8];
         }
-
-        for (ushort row = 0; row < 2; ++row) {
+        // One iteration per output row owned by each SIMD
+        for (ushort row = 0; row < 2; ++row) { 
             long o = long(first_row + row) * nb * 144 + ib * 144;
             device const ushort* sc = reinterpret_cast<device const ushort*>(weights + o + 4) + iq;
             device const ushort* q1 = reinterpret_cast<device const ushort*>(weights + o + 16) + 16 * iq + 4 * ir;
@@ -184,7 +184,9 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
             sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
 
             float4 acc1 = 0.0f, acc2 = 0.0f;
-            for (ushort i = 0; i < 4; ++i) {
+            // 4(loop) * 2(q1,q2) * 2(2byte LOADS) = 16 bytes loaded per lane * 8 (threads_per_cohort) = 128 bytes (256 weight block)
+            for (ushort i = 0; i < 4; ++i) { 
+                // q1 for the first 64 bytes and q2 for the second 64 bytes
                 acc1[0] += yl[2 * i] * float(q1[i] & 0x000f);
                 acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0f00);
                 acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00f0);
@@ -202,7 +204,6 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
         }
         src4 += 4 * 256;
     }
-
     for (ushort row = 0; row < 2; ++row) {
         float sum = simd_sum(sumf[row]);
         if (lane == 0 && first_row + row < N) dst[first_row + row] = half(sum);
