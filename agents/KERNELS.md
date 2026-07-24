@@ -41,3 +41,23 @@ Your workflow has to be:
 
 # Xcode .gputrace
 - Purple: ALU; Orange: Memory; Red: Barrier/Synchronization; Yellow: Control Flow; 
+
+## 2026-07-23 - `q4_k_k4096_n4096_decode`: one row per SIMD
+
+- Gate for this loop: cache-pressured speedup `>= 1.05x` in two fresh processes.
+- Rejected screens: streamed two-row body `0.755x`; incremental `uint` addressing `0.986x`;
+  fixed rolled loop `0.999x`; full unroll `0.590x`; metadata broadcast `0.785x`; TG32 `1.013x`;
+  TG128 `1.008x`.
+- Accepted: specialize only `<K=4096, N=4096>` from two rows/SIMD to one row/SIMD. TG64 remains
+  unchanged; dispatch grows from 65,536 to 131,072 threads, exposing twice as many independent SIMDgroups.
+  Weight bytes and per-row math are unchanged; input reads double, but the input is only 8 KiB.
+- Exact-final-source cache-pressured A/B: `65.27 -> 62.08 us` (`1.051x`, paired `1.060x`)
+  and `60.75 -> 56.88 us` (`1.068x`, paired `1.067x`). Warm speedups were `1.033x` and `1.044x`.
+- Correctness: exact FP16 equality for the deterministic case and ten randomized valid Q4_K matrices;
+  real-model llama.cpp greedy parity passed.
+- Macro: Qwen3.5-9B TPOT `46.85 -> 46.19 ms`, decode `21.35 -> 21.65 tok/s`; peak memory unchanged.
+- AIR for this function: SSA instructions `267 -> 253`, loads `21 -> 19`, branches `14 -> 9`,
+  allocas `3 -> 2`. The accepted source keeps the outer loop rolled.
+- M2 Pro native code: static instructions `412 -> 240`, final instruction address `0xAC4 -> 0x63E`,
+  highest register `r39 -> r35`, device-load sites `22 -> 15`, waits `3 -> 2`, and SIMD reductions
+  `2 -> 1`. Neither version emits `async_load`.

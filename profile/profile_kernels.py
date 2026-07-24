@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse, ctypes, objc, os, re, struct, subprocess, tempfile
+import argparse, ctypes, json, math, objc, os, random, re, statistics, struct, subprocess, tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # captured function has the same name as the source kernel.
 KERNELS = {
     ("Q4_K", 4096, 1024): ("q4_k_k4096_n1024", 64, 4, 144),
-    ("Q4_K", 4096, 4096): ("q4_k_k4096_n4096", 64, 4, 144),
+    ("Q4_K", 4096, 4096): ("q4_k_k4096_n4096", 64, 2, 144),
     ("Q4_K", 12288, 4096): ("q4_k_k12288_n4096", 64, 4, 144),
     ("Q4_K", 4096, 8192): ("q4_k_k4096_n8192", 64, 4, 144),
     ("Q4_K", 4096, 12288): ("q4_k_k4096_n12288", 64, 4, 144),
@@ -48,6 +48,17 @@ def parse_args():
     p.add_argument("--metal-std", default="metal3.2")
     p.add_argument("--m", type=int, default=32, help="Token count for prefill kernels.")
     p.add_argument("--repeat", type=int, default=1)
+    p.add_argument("--warmup", type=int, default=2000)
+    p.add_argument("--samples", type=int, default=1000)
+    p.add_argument("--batches", type=int, default=5)
+    p.add_argument("--pressure-mib", type=int, default=64)
+    p.add_argument("--random-seed", type=int)
+    p.add_argument("--baseline-metallib", type=Path)
+    p.add_argument("--decode-tg", type=int, choices=(32, 64, 128))
+    p.add_argument("--decode-rows", type=int)
+    p.add_argument("--baseline-decode-tg", type=int, choices=(32, 64, 128))
+    p.add_argument("--baseline-decode-rows", type=int)
+    p.add_argument("--json-out", type=Path)
     return p.parse_args()
 
 
@@ -71,10 +82,18 @@ def make_buffers(device, k, n):
     return y, fill_buffer(device, x), fill_buffer(device, bytes(w))
 
 
-def make_quant_buffers(device, quant_type, k, n, block_bytes, m=1):
+def make_quant_buffers(device, quant_type, k, n, block_bytes, m=1, random_seed=None):
     """Return buffers for one decode dispatch using harmless valid quant data."""
     blocks = n * (k // BLOCK_SIZE[quant_type])
     w = bytearray(blocks * block_bytes)
+    if random_seed is not None:
+        if quant_type != "Q4_K": raise ValueError("--random-seed currently supports Q4_K only")
+        rng = random.Random(random_seed)
+        x = b"".join(struct.pack("e", rng.uniform(-1.0, 1.0)) for _ in range(m * k))
+        for o in range(0, len(w), block_bytes):
+            w[o:o + 4] = struct.pack("ee", rng.uniform(0.001, 0.01), rng.uniform(0.001, 0.01))
+            w[o + 4:o + 16] = rng.randbytes(12); w[o + 16:o + block_bytes] = rng.randbytes(block_bytes - 16)
+        return device.newBufferWithLength_options_(m * n * 2, 0), fill_buffer(device, x), fill_buffer(device, bytes(w))
     one, zero = struct.pack("e", 1.0), struct.pack("e", 0.0)
     for o in range(0, len(w), block_bytes):
         w[o:o + 2], w[o + 2:o + 4] = one, zero
@@ -101,6 +120,69 @@ def dispatch(queue, pipe, buffers, threads, tg, m=None):
     enc.dispatchThreads_threadsPerThreadgroup_((threads, 1, 1), (tg, 1, 1))
     enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
     if cb.error(): raise RuntimeError(cb.error())
+    return (cb.GPUEndTime() - cb.GPUStartTime()) * 1e6
+
+
+def cache_pressure(queue, src, dst, size):
+    cb = queue.commandBuffer(); enc = cb.blitCommandEncoder()
+    enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size_(src, 0, dst, 0, size)
+    enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+    if cb.error(): raise RuntimeError(cb.error())
+
+
+def summarize(samples):
+    s = sorted(samples)
+    at = lambda q: s[min(len(s) - 1, round(q * (len(s) - 1)))]
+    return {"min": s[0], "p10": at(0.10), "median": statistics.median(s), "mean": statistics.mean(s),
+            "p90": at(0.90), "p99": at(0.99), "max": s[-1], "variance": statistics.pvariance(s)}
+
+
+def compare_outputs(baseline, candidate, elements):
+    a = struct.unpack(f"{elements}e", ctypes.string_at(baseline.contents(), elements * 2))
+    b = struct.unpack(f"{elements}e", ctypes.string_at(candidate.contents(), elements * 2))
+    diffs = [abs(float(x) - float(y)) for x, y in zip(a, b)]
+    rel = [d / max(abs(float(x)), 1e-12) for d, x in zip(diffs, a)]
+    return {"max_abs": max(diffs), "max_rel": max(rel), "different": sum(x != y for x, y in zip(a, b)),
+            "nonfinite": sum(not math.isfinite(float(x)) for x in b)}
+
+
+def benchmark(queue, candidate, baseline, candidate_buffers, baseline_buffers, candidate_launch, baseline_launch,
+              warmup, samples, batches, pressure_mib, m=None):
+    pipes = [("candidate", candidate, candidate_buffers, *candidate_launch)]
+    if baseline is not None: pipes.insert(0, ("baseline", baseline, baseline_buffers, *baseline_launch))
+    pressure_size = pressure_mib * 2**20
+    pressure = ((queue.device().newBufferWithLength_options_(pressure_size, 0),
+                 queue.device().newBufferWithLength_options_(pressure_size, 0)) if pressure_size else None)
+    result = {}
+    for regime in ("warm", "pressured"):
+        for sample in range(warmup):
+            for _, pipe, buffers, threads, tg in (pipes if sample % 2 == 0 else list(reversed(pipes))):
+                if regime == "pressured" and pressure is not None:
+                    cache_pressure(queue, pressure[0], pressure[1], pressure_size)
+                dispatch(queue, pipe, buffers, threads, tg, m)
+        medians = {name: [] for name, *_ in pipes}; batch_stats = {name: [] for name, *_ in pipes}
+        paired_speedups = []
+        for batch in range(batches):
+            values = {name: [] for name, *_ in pipes}
+            for sample in range(samples):
+                ordered = pipes if (sample + batch) % 2 == 0 else list(reversed(pipes))
+                for name, pipe, buffers, threads, tg in ordered:
+                    if regime == "pressured" and pressure is not None:
+                        cache_pressure(queue, pressure[0], pressure[1], pressure_size)
+                    values[name].append(dispatch(queue, pipe, buffers, threads, tg, m))
+            for name in values:
+                stats = summarize(values[name]); batch_stats[name].append(stats); medians[name].append(stats["median"])
+            if baseline is not None:
+                paired_speedups.append(statistics.median(a / b for a, b in zip(values["baseline"],
+                                                                               values["candidate"])))
+        result[regime] = {name: {"median_of_medians": statistics.median(medians[name]),
+                                 "batches": batch_stats[name]} for name, *_ in pipes}
+        if baseline is not None:
+            result[regime]["speedup"] = (result[regime]["baseline"]["median_of_medians"] /
+                                          result[regime]["candidate"]["median_of_medians"])
+            result[regime]["paired_speedup_median"] = statistics.median(paired_speedups)
+            result[regime]["paired_speedup_batches"] = paired_speedups
+    return result
 
 
 @contextmanager
@@ -138,6 +220,8 @@ def compile_kernel(a, kernel, work):
 
 def main():
     a = parse_args()
+    if min(a.warmup, a.samples, a.batches, a.pressure_mib) < 0 or not a.samples or not a.batches:
+        raise ValueError("--warmup/--pressure-mib must be nonnegative; --samples/--batches must be positive")
     if a.kernel:
         match = re.match(r"(.*)_k(\d+)_n(\d+)_(decode|prefill)$", a.kernel)
         if not match:
@@ -163,17 +247,51 @@ def main():
     fn = lib.newFunctionWithName_(a.kernel)
     pipe = device.newComputePipelineStateWithFunction_error_(fn, None)
     if a.kind == "decode":
-        threads, tg = ((a.n + rows - 1) // rows) * tg, tg
+        baseline_tg, baseline_rows = a.baseline_decode_tg or tg, a.baseline_decode_rows or rows
+        tg, rows = a.decode_tg or tg, a.decode_rows or rows
+        threads, baseline_threads = ((a.n + rows - 1) // rows) * tg, (
+            (a.n + baseline_rows - 1) // baseline_rows) * baseline_tg
         dispatch_m = None
     else:
         tg, threads, dispatch_m = 128, 128 * (a.n // 16), a.m
+        baseline_tg, baseline_threads = tg, threads
         if a.m % 32:
             raise ValueError("--m must be divisible by 32 for prefill kernels")
-    buffers, queue = (make_quant_buffers(device, a.quant_type, a.k, a.n, block_bytes, a.m)
-                      if a.kind == "prefill" else make_quant_buffers(device, a.quant_type, a.k, a.n, block_bytes)), device.newCommandQueue()
+    buffers = (make_quant_buffers(device, a.quant_type, a.k, a.n, block_bytes, a.m, a.random_seed)
+               if a.kind == "prefill" else make_quant_buffers(device, a.quant_type, a.k, a.n, block_bytes,
+                                                               random_seed=a.random_seed))
+    queue = device.newCommandQueue()
     stem = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{a.kernel}"
-    with metal_capture(a.out_dir / f"{stem}.gputrace") as trace:
-        for _ in range(a.repeat): dispatch(queue, pipe, buffers, threads, tg, dispatch_m)
+    trace, results = None, None
+    if torch.mps.profiler.is_metal_capture_enabled():
+        with metal_capture(a.out_dir / f"{stem}.gputrace") as trace:
+            for _ in range(a.repeat): dispatch(queue, pipe, buffers, threads, tg, dispatch_m)
+    else:
+        baseline_pipe = baseline_buffers = correctness = None
+        if a.baseline_metallib:
+            baseline_lib = device.newLibraryWithFile_error_(str(a.baseline_metallib.resolve()), None)
+            baseline_pipe = device.newComputePipelineStateWithFunction_error_(
+                baseline_lib.newFunctionWithName_(a.kernel), None)
+            output_elements = a.n if a.kind == "decode" else a.m * a.n
+            baseline_y = device.newBufferWithLength_options_(output_elements * 2, 0)
+            baseline_buffers = (baseline_y, *buffers[1:])
+            dispatch(queue, baseline_pipe, baseline_buffers, baseline_threads, baseline_tg, dispatch_m)
+            dispatch(queue, pipe, buffers, threads, tg, dispatch_m)
+            correctness = compare_outputs(baseline_y, buffers[0], output_elements)
+        timing = benchmark(queue, pipe, baseline_pipe, buffers, baseline_buffers, (threads, tg),
+                           (baseline_threads, baseline_tg), a.warmup, a.samples, a.batches, a.pressure_mib,
+                           dispatch_m)
+        results = {"kernel": a.kernel, "dispatch_threads": [threads, 1, 1], "threads_per_threadgroup": [tg, 1, 1],
+                   "baseline_dispatch_threads": [baseline_threads, 1, 1],
+                   "baseline_threads_per_threadgroup": [baseline_tg, 1, 1],
+                   "warmup": a.warmup, "samples_per_batch": a.samples, "batches": a.batches,
+                   "pressure_mib": a.pressure_mib, "random_seed": a.random_seed, "correctness": correctness,
+                   "timing_us": timing, "pipeline_max_threads": pipe.maxTotalThreadsPerThreadgroup(),
+                   "thread_execution_width": pipe.threadExecutionWidth()}
+        json_out = (a.json_out or work / "benchmark.json").resolve()
+        json_out.parent.mkdir(parents=True, exist_ok=True); json_out.write_text(json.dumps(results, indent=2) + "\n")
+        print(json.dumps(results, indent=2))
+        print(f"benchmark_json={json_out}")
     print(f"kernel={a.kernel}")
     print(f"compile=xcrun metal -std={a.metal_std} -O3 -c {a.source.resolve()} -o {work / 'kernel.air'}")
     print(f"source={a.source.resolve()}")
@@ -182,7 +300,8 @@ def main():
     print(f"thread_execution_width={pipe.threadExecutionWidth()}")
     print(f"workdir={work}")
     if trace and trace.exists(): print(f"metal_capture={trace}\nopen_xcode=open {trace}")
-    else: print(f"metal_capture=disabled; example=MTL_CAPTURE_ENABLED=1 python {Path(__file__).relative_to(ROOT)}")
+    elif results is None:
+        print(f"metal_capture=disabled; example=MTL_CAPTURE_ENABLED=1 python {Path(__file__).relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
