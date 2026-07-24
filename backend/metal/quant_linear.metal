@@ -271,6 +271,24 @@ kernel void decode_q5k(device half* dst [[buffer(0)]], device const half* src [[
     if (lane == 0 && row < N) dst[row] = half(sum);
 }
 
+static inline __attribute__((always_inline)) float q6k_block(
+        device const uchar* w, ushort q_offset_l, ushort q_offset_h, ushort is,
+        thread const float* yl) {
+    device const uchar* q1 = w + q_offset_l;
+    device const uchar* q2 = q1 + 32;
+    device const uchar* qh = w + 128 + q_offset_h;
+    device const char* sc = reinterpret_cast<device const char*>(w + 192 + is);
+    float4 sums = 0.0f;
+    for (ushort l = 0; l < 4; ++l) {
+        sums[0] += yl[4 * l] * (float((q1[l] & 15) | ((qh[l] & 0x03) << 4)) - 32.0f);
+        sums[1] += yl[4 * l + 1] * (float((q2[l] & 15) | ((qh[l] & 0x0c) << 2)) - 32.0f);
+        sums[2] += yl[4 * l + 2] * (float((q1[l] >> 4) | (qh[l] & 0x30)) - 32.0f);
+        sums[3] += yl[4 * l + 3] * (float((q2[l] >> 4) | ((qh[l] & 0xc0) >> 2)) - 32.0f);
+    }
+    float d = float(*reinterpret_cast<device const half*>(w + 208));
+    return d * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+}
+
 template<uint K, uint N>
 [[max_total_threads_per_threadgroup(64)]]
 kernel void decode_q6k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
@@ -283,6 +301,9 @@ kernel void decode_q6k(device half* dst [[buffer(0)]], device const half* src [[
     ushort is = 8 * ip + l0 / 16, y_offset = 128 * ip + l0;
     ushort q_offset_l = 64 * ip + l0, q_offset_h = 32 * ip + l0;
     float yl[16], sumf[2] = {0.0f, 0.0f};
+    long row_stride = long(nb) * 210;
+    device const uchar* w0 = weights + long(first_row) * row_stride + ix * 210;
+    device const uchar* w1 = w0 + row_stride;
 
     for (uint ib = ix; ib < nb; ib += 2) {
         device const half* y = src + ib * 256 + y_offset;
@@ -290,22 +311,10 @@ kernel void decode_q6k(device half* dst [[buffer(0)]], device const half* src [[
             yl[4 * l] = float(y[l]); yl[4 * l + 1] = float(y[l + 32]);
             yl[4 * l + 2] = float(y[l + 64]); yl[4 * l + 3] = float(y[l + 96]);
         }
-        for (ushort row = 0; row < 2; ++row) {
-            long o = long(first_row + row) * nb * 210 + ib * 210;
-            device const uchar* q1 = weights + o + q_offset_l;
-            device const uchar* q2 = q1 + 32;
-            device const uchar* qh = weights + o + 128 + q_offset_h;
-            device const char* sc = reinterpret_cast<device const char*>(weights + o + 192 + is);
-            float4 sums = 0.0f;
-            for (ushort l = 0; l < 4; ++l) {
-                sums[0] += yl[4 * l] * (float((q1[l] & 15) | ((qh[l] & 0x03) << 4)) - 32.0f);
-                sums[1] += yl[4 * l + 1] * (float((q2[l] & 15) | ((qh[l] & 0x0c) << 2)) - 32.0f);
-                sums[2] += yl[4 * l + 2] * (float((q1[l] >> 4) | (qh[l] & 0x30)) - 32.0f);
-                sums[3] += yl[4 * l + 3] * (float((q2[l] >> 4) | ((qh[l] & 0xc0) >> 2)) - 32.0f);
-            }
-            float d = float(*reinterpret_cast<device const half*>(weights + o + 208));
-            sumf[row] += d * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
-        }
+        sumf[0] += q6k_block(w0, q_offset_l, q_offset_h, is, yl);
+        sumf[1] += q6k_block(w1, q_offset_l, q_offset_h, is, yl);
+        w0 += 420;
+        w1 += 420;
     }
     for (ushort row = 0; row < 2; ++row) {
         float sum = simd_sum(sumf[row]);
