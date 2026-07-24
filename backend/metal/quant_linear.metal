@@ -148,7 +148,7 @@ kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buff
 
 // DECODE KERNELS
 
-template<uint K, uint N>
+template<uint K, uint N, ushort ROWS = 2>
 [[max_total_threads_per_threadgroup(64)]]
 kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
                              device const uchar* weights [[buffer(2)]],
@@ -157,20 +157,20 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
                              uint3 group [[threadgroup_position_in_grid]]) {
     constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
     ushort ix = lane / 8, it = lane % 8, iq = it / 4, ir = it % 4;
-    uint nb = K / 256, first_row = (group.x * 2 + simd_group) * 2;
-    float yl[16], yh[16], sumf[2] = {0.0f, 0.0f};
+    uint nb = K / 256, first_row = (group.x * 2 + simd_group) * ROWS;
+    float yl[16], yh[16], sumf[ROWS] = {0.0f};
     device const half* src4 = src + ix * 256 + 64 * iq + 8 * ir;
 
     for (uint ib = ix; ib < nb; ib += 4) {
         float4 sumy = 0.0f;
         for (ushort i = 0; i < 8; ++i) {
+            // load(x_i) -> sum(x_i)
             yl[i] = float(src4[i]);       sumy[0] += yl[i];
             yl[i + 8] = float(src4[i + 32]);  sumy[1] += yl[i + 8];
             yh[i] = float(src4[i + 128]);     sumy[2] += yh[i];
             yh[i + 8] = float(src4[i + 160]); sumy[3] += yh[i + 8];
         }
-        // One iteration per output row owned by each SIMD
-        for (ushort row = 0; row < 2; ++row) { 
+        for (ushort row = 0; row < ROWS; ++row) { // one iter per column of w^t owned by SIMD
             long o = long(first_row + row) * nb * 144 + ib * 144;
             device const ushort* sc = reinterpret_cast<device const ushort*>(weights + o + 4) + iq;
             device const ushort* q1 = reinterpret_cast<device const ushort*>(weights + o + 16) + 16 * iq + 4 * ir;
@@ -178,6 +178,7 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
             device const half* dh = reinterpret_cast<device const half*>(weights + o);
             ushort sc16[4];
             thread const uchar* sc8 = reinterpret_cast<thread const uchar*>(sc16);
+            // load 6 bytes that the team owns (mi, si) in i = {1, 2, 5, 6} or {3, 4, 7, 8}
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
             sc16[2] = (sc[4] & kmask2) | ((sc[0] & kmask3) >> 2);
@@ -186,7 +187,7 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
             float4 acc1 = 0.0f, acc2 = 0.0f;
             // 4(loop) * 2(q1,q2) * 2(2byte LOADS) = 16 bytes loaded per lane * 8 (threads_per_cohort) = 128 bytes (256 weight block)
             for (ushort i = 0; i < 4; ++i) { 
-                // q1 for the first 64 bytes and q2 for the second 64 bytes
+                // sum(xi . qi) unshifted (only mask to isolate the rest 12b)
                 acc1[0] += yl[2 * i] * float(q1[i] & 0x000f);
                 acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0f00);
                 acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00f0);
@@ -196,6 +197,7 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
                 acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00f0);
                 acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xf000);
             }
+            // remove the shifts + apply group scales and mins + global scales and mins
             sumf[row] += float(dh[0]) * ((acc1[0] + acc1[1] / 256.0f) * sc8[0] +
                                          (acc1[2] + acc1[3] / 256.0f) * sc8[1] / 16.0f +
                                          (acc2[0] + acc2[1] / 256.0f) * sc8[4] +
@@ -204,7 +206,7 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
         }
         src4 += 4 * 256;
     }
-    for (ushort row = 0; row < 2; ++row) {
+    for (ushort row = 0; row < ROWS; ++row) {
         float sum = simd_sum(sumf[row]);
         if (lane == 0 && first_row + row < N) dst[first_row + row] = half(sum);
     }
@@ -415,7 +417,7 @@ template [[host_name("q4_k_k12288_n4096_prefill")]] kernel void prefill_qk<q4k_t
 template [[host_name("q4_k_k4096_n8192_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 8192>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q4_k_k4096_n12288_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 12288>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
 template [[host_name("q4_k_k4096_n1024_decode")]] kernel void decode_q4k<4096, 1024>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
-template [[host_name("q4_k_k4096_n4096_decode")]] kernel void decode_q4k<4096, 4096>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
+template [[host_name("q4_k_k4096_n4096_decode")]] kernel void decode_q4k<4096, 4096, 1>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
 template [[host_name("q4_k_k12288_n4096_decode")]] kernel void decode_q4k<12288, 4096>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
 template [[host_name("q4_k_k4096_n8192_decode")]] kernel void decode_q4k<4096, 8192>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
 template [[host_name("q4_k_k4096_n12288_decode")]] kernel void decode_q4k<4096, 12288>(device half*, device const half*, device const uchar*, ushort, ushort, uint3);
