@@ -213,7 +213,6 @@ kernel void decode_q4k(device half* dst [[buffer(0)]], device const half* src [[
 }
 
 template<uint K, uint N>
-[[max_total_threads_per_threadgroup(64)]]
 kernel void decode_q5k(device half* dst [[buffer(0)]], device const half* src [[buffer(1)]],
                              device const uchar* weights [[buffer(2)]],
                              ushort lane [[thread_index_in_simdgroup]],
@@ -224,18 +223,11 @@ kernel void decode_q5k(device half* dst [[buffer(0)]], device const half* src [[
     ushort tid = lane / 4, ix = lane % 4, iq = tid / 4, ir = tid % 4, l0 = 8 * ir;
     ushort q_offset = 32 * iq + l0, y_offset = 64 * iq + l0;
     uchar hm1 = 1u << (2 * iq), hm2 = hm1 << 1, hm3 = hm1 << 4, hm4 = hm2 << 4;
-    float yl[16], yh[16], sumf = 0.0f;
+    float sumf = 0.0f;
     device const half* src1 = src + ix * 256 + y_offset;
 
     for (uint ib = ix; ib < nb; ib += 4) {
         device const half* src2 = src1 + 128;
-        float4 sumy = 0.0f;
-        for (ushort l = 0; l < 8; ++l) {
-            yl[l] = float(src1[l]);      sumy[0] += yl[l];
-            yl[l + 8] = float(src1[l + 32]); sumy[1] += yl[l + 8];
-            yh[l] = float(src2[l]);      sumy[2] += yh[l];
-            yh[l + 8] = float(src2[l + 32]); sumy[3] += yh[l + 8];
-        }
         long o = long(row) * nb * 176 + ib * 176;
         device const uchar* q1 = weights + o + 48 + q_offset;
         device const uchar* q2 = q1 + 64;
@@ -248,23 +240,62 @@ kernel void decode_q5k(device half* dst [[buffer(0)]], device const half* src [[
         sc16[1] = sc[2] & kmask1;
         sc16[2] = (sc[4] & kmask2) | ((sc[0] & kmask3) >> 2);
         sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-        float4 acc1 = 0.0f, acc2 = 0.0f;
-        for (ushort l = 0; l < 8; ++l) {
-            uchar h = qh[l];
-            acc1[0] += yl[l] * float(q1[l] & 0x0f);
-            acc1[1] += yl[l + 8] * float(q1[l] & 0xf0);
-            acc1[2] += yh[l] * float(q2[l] & 0x0f);
-            acc1[3] += yh[l + 8] * float(q2[l] & 0xf0);
-            acc2[0] += h & hm1 ? yl[l] : 0.0f;
-            acc2[1] += h & hm2 ? yl[l + 8] : 0.0f;
-            acc2[2] += h & hm3 ? yh[l] : 0.0f;
-            acc2[3] += h & hm4 ? yh[l + 8] : 0.0f;
+        float sumq = 0.0f, summin = 0.0f;
+        // This is doing 4 sequential steps of accumulations (one per group it owns),
+        // seeing the .air generated qh, q1, q2 are loaded only once and reused for the two groups they load
+        {
+            float acc1 = 0.0f, acc2 = 0.0f, sumy = 0.0f;
+#pragma clang loop unroll(full)
+            for (ushort l = 0; l < 8; ++l) {
+                float y = float(src1[l]);
+                uchar h = qh[l];
+                sumy += y;
+                acc1 += y * float(q1[l] & 0x0f);
+                acc2 += h & hm1 ? y : 0.0f;
+            }
+            sumq += sc8[0] * (acc1 + 16.0f * acc2);
+            summin += sc8[2] * sumy;
         }
-        sumf += float(dh[0]) * (sc8[0] * (acc1[0] + 16.0f * acc2[0]) +
-                                sc8[1] * (acc1[1] / 16.0f + 16.0f * acc2[1]) +
-                                sc8[4] * (acc1[2] + 16.0f * acc2[2]) +
-                                sc8[5] * (acc1[3] / 16.0f + 16.0f * acc2[3])) -
-                float(dh[1]) * dot(sumy, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
+        {
+            float acc1 = 0.0f, acc2 = 0.0f, sumy = 0.0f;
+#pragma clang loop unroll(full)
+            for (ushort l = 0; l < 8; ++l) {
+                float y = float(src1[l + 32]);
+                uchar h = qh[l];
+                sumy += y;
+                acc1 += y * float(q1[l] & 0xf0);
+                acc2 += h & hm2 ? y : 0.0f;
+            }
+            sumq += sc8[1] * (acc1 / 16.0f + 16.0f * acc2);
+            summin += sc8[3] * sumy;
+        }
+        {
+            float acc1 = 0.0f, acc2 = 0.0f, sumy = 0.0f;
+#pragma clang loop unroll(full)
+            for (ushort l = 0; l < 8; ++l) {
+                float y = float(src2[l]);
+                uchar h = qh[l];
+                sumy += y;
+                acc1 += y * float(q2[l] & 0x0f);
+                acc2 += h & hm3 ? y : 0.0f;
+            }
+            sumq += sc8[4] * (acc1 + 16.0f * acc2);
+            summin += sc8[6] * sumy;
+        }
+        {
+            float acc1 = 0.0f, acc2 = 0.0f, sumy = 0.0f;
+#pragma clang loop unroll(full)
+            for (ushort l = 0; l < 8; ++l) {
+                float y = float(src2[l + 32]);
+                uchar h = qh[l];
+                sumy += y;
+                acc1 += y * float(q2[l] & 0xf0);
+                acc2 += h & hm4 ? y : 0.0f;
+            }
+            sumq += sc8[5] * (acc1 / 16.0f + 16.0f * acc2);
+            summin += sc8[7] * sumy;
+        }
+        sumf += float(dh[0]) * sumq - float(dh[1]) * summin;
         src1 += 4 * 256;
     }
     float sum = simd_sum(sumf);
