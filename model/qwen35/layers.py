@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from backend.metal import get_delta_rule_kernels, get_fused_layer_kernels, get_quant_linear_kernels
+from backend.metal import get_attention_kernels, get_delta_rule_kernels, get_fused_layer_kernels, get_quant_linear_kernels
 
 
 def _get(config: Any, name: str, default: Any = None) -> Any:
@@ -151,6 +151,7 @@ class FullAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
         self.rotary_emb = RotaryEmbedding(config)
+        self.attention_metal = get_attention_kernels()
 
     def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
                 attention_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -165,31 +166,26 @@ class FullAttention(nn.Module):
                                                        self.head_dim).transpose(1, 2)
         query_states, key_states = self.rotary_emb(query_states, key_states, hidden_states, position_ids)
 
-        if memory is not None:
-            key_states, value_states = memory.update(key_states, value_states)
-
-        key_states = _repeat_kv(key_states, self.num_key_value_groups)
-        value_states = _repeat_kv(value_states, self.num_key_value_groups)
-
-        q_len, k_len = query_states.shape[-2], key_states.shape[-2]
-        attn_mask, is_causal = None, False
-        if attention_mask is not None:
-            if attention_mask.ndim == 2:
-                attn_mask = attention_mask[:, None, None, :].bool()
-            else:
-                attn_mask = attention_mask
-        elif q_len == k_len:
-            is_causal = True
-        elif q_len == 1:
-            # A single decode query is the newest cache entry and can attend
-            # to every valid key, so no mask is needed.
-            pass
+        if seq_len == 1 and memory is not None:
+            cache_keys, cache_values, context_length = memory.prepare_decode(key_states, value_states)
+            attn_output = self.attention_metal.decode(query_states, key_states, value_states,
+                                                      cache_keys, cache_values, context_length)
         else:
-            attn_mask = torch.ones(q_len, k_len, dtype=torch.bool, device=query_states.device).tril(
-                diagonal=k_len - q_len)
-
-        attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=attn_mask,
-                                                     dropout_p=0.0, is_causal=is_causal)
+            if memory is not None:
+                key_states, value_states = memory.update(key_states, value_states)
+            key_states = _repeat_kv(key_states, self.num_key_value_groups)
+            value_states = _repeat_kv(value_states, self.num_key_value_groups)
+            q_len, k_len = query_states.shape[-2], key_states.shape[-2]
+            attn_mask, is_causal = None, False
+            if attention_mask is not None:
+                attn_mask = attention_mask[:, None, None, :].bool() if attention_mask.ndim == 2 else attention_mask
+            elif q_len == k_len:
+                is_causal = True
+            else:
+                attn_mask = torch.ones(q_len, k_len, dtype=torch.bool, device=query_states.device).tril(
+                    diagonal=k_len - q_len)
+            attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states,
+                                                         attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)

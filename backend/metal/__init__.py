@@ -10,6 +10,7 @@ import torch
 _DELTA_RULE_KERNELS: "DeltaRuleKernels | None" = None
 _QUANT_LINEAR_KERNELS: "QuantLinearKernels | None" = None
 _FUSED_LAYER_KERNELS: "FusedLayerKernels | None" = None
+_ATTENTION_KERNELS: "AttentionKernels | None" = None
 # The 32-token Metal prefill solve can become unstable on real Qwen3.5 activations.
 _DELTA_PREFILL_CHUNK = 16
 MLP_HIDDEN_SIZE = 4096
@@ -83,6 +84,26 @@ def get_delta_rule_kernels() -> DeltaRuleKernels:
     if _DELTA_RULE_KERNELS is None:
         _DELTA_RULE_KERNELS = DeltaRuleKernels(_compile("delta_rule.metal"))
     return _DELTA_RULE_KERNELS
+
+
+@dataclass
+class AttentionKernels:
+    lib: object
+
+    def decode(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+               cache_keys: torch.Tensor, cache_values: torch.Tensor, context_length: int) -> torch.Tensor:
+        output = torch.empty_like(query, memory_format=torch.contiguous_format)
+        batch_size = query.shape[0]
+        self.lib.attention_decode(output, query, key, value, cache_keys, cache_values, batch_size, context_length,
+                                  cache_keys.shape[2], threads=[batch_size * 16 * 128, 1, 1], group_size=[128, 1, 1])
+        return output
+
+
+def get_attention_kernels() -> AttentionKernels:
+    global _ATTENTION_KERNELS
+    if _ATTENTION_KERNELS is None:
+        _ATTENTION_KERNELS = AttentionKernels(_compile("attention.metal"))
+    return _ATTENTION_KERNELS
 
 
 @dataclass

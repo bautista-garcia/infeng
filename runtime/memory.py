@@ -39,6 +39,13 @@ class FullAttentionMemory:
                  device: torch.device, initial_length: int = 0):
         self._ensure_capacity(initial_length, batch_size, num_heads, head_dim, dtype, device)
 
+    def prepare_decode(self, keys: torch.Tensor, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+        old_length = self.length
+        self._ensure_capacity(old_length + keys.shape[2], keys.shape[0], keys.shape[1], keys.shape[3],
+                              keys.dtype, keys.device)
+        self.length += keys.shape[2]
+        return self.keys, self.values, old_length
+
     def update(self, keys: torch.Tensor,
                values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_heads, token_count, head_dim = keys.shape
