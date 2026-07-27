@@ -12,12 +12,12 @@ from .memory import Memory, RequestMemory
 
 
 class InferenceEngine:
-    def __init__(self, weights: str | Path, tokenizer: str):
+    def __init__(self, weights: str | Path, tokenizer: str, *, max_cache_length: int | None = None):
         self.device, self.dtype = torch.device("mps"), torch.float16
         self.model = ForCausalLM(weights).eval()
         load_weights(self.model, weights)
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
-        self.memory = Memory(self.model.config)
+        self.memory = Memory(self.model.config, max_cache_length)
         self.paged_attention = self.prefix_cache = None
 
     def _sample(self, logits: torch.Tensor, temperature: float = 0.0, top_p: float = 1.0,
@@ -38,7 +38,7 @@ class InferenceEngine:
         return self.model(input_ids, memory.position_ids(input_ids), memory), memory
 
     def prefill(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, RequestMemory]:
-        memory = self.memory.new_request()
+        memory = self.memory.new_request(input_ids.shape[1])
         return self._run(input_ids, memory)
 
     def decode(self, input_ids: torch.Tensor, memory: RequestMemory) -> tuple[torch.Tensor, RequestMemory]:

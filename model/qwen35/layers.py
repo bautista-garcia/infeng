@@ -165,9 +165,8 @@ class FullAttention(nn.Module):
                                                        self.head_dim).transpose(1, 2)
         query_states, key_states = self.rotary_emb(query_states, key_states, hidden_states, position_ids)
 
-        key_mask = None
         if memory is not None:
-            key_states, value_states, key_mask = memory.update(key_states, value_states)
+            key_states, value_states = memory.update(key_states, value_states)
 
         key_states = _repeat_kv(key_states, self.num_key_value_groups)
         value_states = _repeat_kv(value_states, self.num_key_value_groups)
@@ -179,11 +178,12 @@ class FullAttention(nn.Module):
                 attn_mask = attention_mask[:, None, None, :].bool()
             else:
                 attn_mask = attention_mask
-        elif key_mask is not None:
-            attn_mask = (torch.arange(k_len, device=key_states.device)[None, None, None, :] <=
-                         position_ids[:, None, :, None]) & key_mask[None, None, None, :]
         elif q_len == k_len:
             is_causal = True
+        elif q_len == 1:
+            # A single decode query is the newest cache entry and can attend
+            # to every valid key, so no mask is needed.
+            pass
         else:
             attn_mask = torch.ones(q_len, k_len, dtype=torch.bool, device=query_states.device).tril(
                 diagonal=k_len - q_len)

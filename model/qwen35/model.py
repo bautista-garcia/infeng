@@ -21,7 +21,7 @@ class TextModel(nn.Module):
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, memory: Any,
                 attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        memory.allocate(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
+        memory.allocate(hidden_states.shape[0], hidden_states.dtype, hidden_states.device, hidden_states.shape[1])
         for layer, layer_memory in zip(self.layers, memory.layers):
             hidden_states = layer(hidden_states, position_ids, layer_memory, attention_mask=attention_mask)
         return self.norm(hidden_states)
