@@ -92,11 +92,24 @@ class AttentionKernels:
 
     def __call__(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                  cache_keys: torch.Tensor, cache_values: torch.Tensor, context_length: int) -> torch.Tensor:
+        return (self.decode if query.shape[1] == 1 else self.prefill)(query, key, value, cache_keys, cache_values,
+                                                                       context_length)
+
+    def prefill(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                cache_keys: torch.Tensor, cache_values: torch.Tensor, context_length: int) -> torch.Tensor:
         output = torch.empty_like(query, memory_format=torch.contiguous_format)
         batch_size, seq_len = query.shape[:2]
-        self.lib.attention(output, query, key, value, cache_keys, cache_values, batch_size, seq_len, context_length,
-                           cache_keys.shape[2], threads=[batch_size * seq_len * 16 * 128, 1, 1],
-                           group_size=[128, 1, 1])
+        self.lib.attention_prefill(output, query, key, value, cache_keys, cache_values, batch_size, seq_len,
+                                   context_length, cache_keys.shape[2], threads=[batch_size * seq_len * 16 * 128, 1, 1],
+                                   group_size=[128, 1, 1])
+        return output
+
+    def decode(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+               cache_keys: torch.Tensor, cache_values: torch.Tensor, context_length: int) -> torch.Tensor:
+        output = torch.empty_like(query, memory_format=torch.contiguous_format)
+        batch_size = query.shape[0]
+        self.lib.attention_decode(output, query, key, value, cache_keys, cache_values, batch_size, context_length,
+                                  cache_keys.shape[2], threads=[batch_size * 16 * 128, 1, 1], group_size=[128, 1, 1])
         return output
 
 
