@@ -13,15 +13,6 @@ def _get(config: Any, name: str, default: Any = None) -> Any:
     return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
 
 
-def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    if n_rep == 1:
-        return x
-
-    batch, kv_heads, seq_len, head_dim = x.shape
-    x = x[:, :, None, :, :].expand(batch, kv_heads, n_rep, seq_len, head_dim)
-    return x.reshape(batch, kv_heads * n_rep, seq_len, head_dim)
-
-
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
 
@@ -116,8 +107,8 @@ class RotaryEmbedding(nn.Module):
         freqs = (inv_freq @ pos).transpose(2, 3)
         freqs = self._apply_interleaved_mrope(freqs)
         emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().type(x.dtype).unsqueeze(1)
-        sin = emb.sin().type(x.dtype).unsqueeze(1)
+        cos = emb.cos().type(x.dtype).unsqueeze(2)
+        sin = emb.sin().type(x.dtype).unsqueeze(2)
         q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
         k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
         q = torch.cat((q_rot * cos + _rotate_half(q_rot) * sin, q_pass), dim=-1)
@@ -140,7 +131,6 @@ class FullAttention(nn.Module):
         self.num_heads = _get(config, "num_attention_heads")
         self.num_key_value_heads = _get(config, "num_key_value_heads")
         self.head_dim = _get(config, "head_dim", self.hidden_size // self.num_heads)
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         attention_bias = _get(config, "attention_bias", False)
         eps = _get(config, "rms_norm_eps", 1e-6)
 
@@ -153,40 +143,25 @@ class FullAttention(nn.Module):
         self.rotary_emb = RotaryEmbedding(config)
         self.attention_metal = get_attention_kernels()
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         q_and_gate = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim * 2)
         query_states, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
-        query_states = self.q_norm(query_states).transpose(1, 2)
+        query_states = self.q_norm(query_states)
         key_states = self.k_norm(self.k_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads,
-                                                                 self.head_dim)).transpose(1, 2)
+                                                                 self.head_dim))
         value_states = self.v_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads,
-                                                       self.head_dim).transpose(1, 2)
+                                                       self.head_dim)
         query_states, key_states = self.rotary_emb(query_states, key_states, hidden_states, position_ids)
-
-        if seq_len == 1 and memory is not None:
-            cache_keys, cache_values, context_length = memory.prepare_decode(key_states, value_states)
-            attn_output = self.attention_metal.decode(query_states, key_states, value_states,
-                                                      cache_keys, cache_values, context_length)
-        else:
-            if memory is not None:
-                key_states, value_states = memory.update(key_states, value_states)
-            key_states = _repeat_kv(key_states, self.num_key_value_groups)
-            value_states = _repeat_kv(value_states, self.num_key_value_groups)
-            q_len, k_len = query_states.shape[-2], key_states.shape[-2]
-            attn_mask, is_causal = None, False
-            if attention_mask is not None:
-                attn_mask = attention_mask[:, None, None, :].bool() if attention_mask.ndim == 2 else attention_mask
-            elif q_len == k_len:
-                is_causal = True
-            else:
-                attn_mask = torch.ones(q_len, k_len, dtype=torch.bool, device=query_states.device).tril(
-                    diagonal=k_len - q_len)
-            attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states,
-                                                         attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        if memory.buffer is None:
+            memory.buffer = key_states.new_empty((2, batch_size, self.num_key_value_heads,
+                                                  memory.max_context, self.head_dim))
+        cache_keys, cache_values = memory.buffer
+        attn_output = self.attention_metal(query_states, key_states, value_states, cache_keys, cache_values,
+                                           memory.length)
+        memory.length += seq_len
+        attn_output = attn_output.reshape(batch_size, seq_len, -1)
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
 
@@ -217,11 +192,7 @@ class GatedDeltaNet(nn.Module):
         self.delta_rule_metal = get_delta_rule_kernels()
         self.fused_layers = get_fused_layer_kernels()
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        if attention_mask is not None and attention_mask.ndim == 2:
-            hidden_states = hidden_states * attention_mask[:, :, None].type(hidden_states.dtype)
-
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         mixed_qkv, z, b, a = (proj(hidden_states) for proj in (
             self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a))
@@ -233,9 +204,8 @@ class GatedDeltaNet(nn.Module):
     def _delta(self, mixed_qkv: torch.Tensor, z: torch.Tensor, beta: torch.Tensor, g: torch.Tensor,
                batch_size: int, seq_len: int, memory: Any) -> torch.Tensor:
         mixed_qkv, conv_state = self.fused_layers.causal_conv_silu(mixed_qkv, self.conv1d_weight.data,
-                                                                    None if memory is None else memory.conv_state)
-        if memory is not None:
-            memory.conv_state = conv_state
+                                                                    memory.conv)
+        memory.conv = conv_state
 
         query, key, value = torch.split(mixed_qkv, (self.key_dim, self.key_dim, self.value_dim), dim=-1)
         query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
@@ -247,10 +217,8 @@ class GatedDeltaNet(nn.Module):
             query = query.repeat(1, 1, repeat, 1)
             key = key.repeat(1, 1, repeat, 1)
 
-        initial_state = None if memory is None else memory.recurrent_state
-        output, recurrent_state = self.delta_rule_metal(query, key, value, g, beta, initial_state)
-        if memory is not None:
-            memory.recurrent_state = recurrent_state
+        output, recurrent_state = self.delta_rule_metal(query, key, value, g, beta, memory.recurrent)
+        memory.recurrent = recurrent_state
 
         output = output.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -275,13 +243,12 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
         self.mlp = MLP(config)
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         attn = getattr(self, self._attn_name)
-        hidden_states = attn(hidden_states, position_ids, memory, attention_mask=attention_mask)
+        hidden_states = attn(hidden_states, position_ids, memory)
 
         hidden_states = residual + hidden_states
         residual = hidden_states

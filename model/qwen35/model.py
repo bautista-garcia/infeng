@@ -18,12 +18,10 @@ class TextModel(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(self.config, i) for i in range(self.config["num_hidden_layers"]))
         self.norm = RMSNorm(self.config["hidden_size"], eps=self.config.get("rms_norm_eps", 1e-6))
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, memory: Any,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, memory: Any) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        memory.allocate(hidden_states.shape[0], hidden_states.dtype, hidden_states.device, hidden_states.shape[1])
         for layer, layer_memory in zip(self.layers, memory.layers):
-            hidden_states = layer(hidden_states, position_ids, layer_memory, attention_mask=attention_mask)
+            hidden_states = layer(hidden_states, position_ids, layer_memory)
         return self.norm(hidden_states)
 
 
@@ -40,6 +38,5 @@ class ForCausalLM(nn.Module):
             self.model = TextModel(self.config)
             self.lm_head = LMHead(self.config["hidden_size"], self.config["vocab_size"])
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, memory: Any,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        return self.lm_head(self.model(input_ids, position_ids, memory, attention_mask=attention_mask)[:, -1:])
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, memory: Any) -> torch.Tensor:
+        return self.lm_head(self.model(input_ids, position_ids, memory)[:, -1:])

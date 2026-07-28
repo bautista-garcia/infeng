@@ -8,16 +8,18 @@ from transformers import AutoTokenizer
 
 from model.qwen35.model import ForCausalLM
 from model.qwen35.weights import load_weights
-from .memory import Memory, RequestMemory
+from .memory import GDNState, KVCache, Memory
 
 
 class InferenceEngine:
-    def __init__(self, weights: str | Path, tokenizer: str, *, max_cache_length: int | None = None):
+    def __init__(self, weights: str | Path, tokenizer: str, *, max_context: int = 4096):
+        if not 0 < max_context <= 4096:
+            raise ValueError(f"max_context must be between 1 and 4096, got {max_context}")
         self.device, self.dtype = torch.device("mps"), torch.float16
         self.model = ForCausalLM(weights).eval()
         load_weights(self.model, weights)
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
-        self.memory = Memory(self.model.config, max_cache_length)
+        self.max_context = max_context
         self.paged_attention = self.prefix_cache = None
 
     def _sample(self, logits: torch.Tensor, temperature: float = 0.0, top_p: float = 1.0,
@@ -34,14 +36,21 @@ class InferenceEngine:
             logits = logits.scatter(1, sorted_idx, sorted_logits.masked_fill(remove, -torch.inf))
         return torch.multinomial(F.softmax(logits, dim=-1), 1)
 
-    def _run(self, input_ids: torch.Tensor, memory: RequestMemory) -> tuple[torch.Tensor, RequestMemory]:
-        return self.model(input_ids, memory.position_ids(input_ids), memory), memory
+    def _run(self, input_ids: torch.Tensor, memory: Memory) -> tuple[torch.Tensor, Memory]:
+        cache = next(state for state in memory.layers if isinstance(state, KVCache))
+        end = cache.length + input_ids.shape[1]
+        if end > cache.max_context:
+            raise ValueError(f"context requires {end} tokens, but max_context is {cache.max_context}")
+        positions = torch.arange(cache.length, end, device=input_ids.device)[None].expand(input_ids.shape[0], -1)
+        return self.model(input_ids, positions, memory), memory
 
-    def prefill(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, RequestMemory]:
-        memory = self.memory.new_request(input_ids.shape[1])
+    def prefill(self, input_ids: torch.Tensor, memory: Memory | None = None) -> tuple[torch.Tensor, Memory]:
+        if memory is None:
+            memory = Memory([KVCache(self.max_context) if t == "full_attention" else GDNState()
+                             for t in self.model.config["layer_types"]])
         return self._run(input_ids, memory)
 
-    def decode(self, input_ids: torch.Tensor, memory: RequestMemory) -> tuple[torch.Tensor, RequestMemory]:
+    def decode(self, input_ids: torch.Tensor, memory: Memory) -> tuple[torch.Tensor, Memory]:
         return self._run(input_ids, memory)
 
     @torch.no_grad()
@@ -57,8 +66,8 @@ class InferenceEngine:
         if stop_token_ids is None:
             im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
             stop_token_ids = [t for t in (self.tokenizer.eos_token_id, im_end) if t is not None]
-        max_position = self.model.config.get("max_position_embeddings", 4096)
-        max_new_tokens = max_position - tokens.shape[1] if max_new_tokens is None else max_new_tokens
+        remaining = self.max_context - tokens.shape[1]
+        max_new_tokens = remaining if max_new_tokens is None else min(max_new_tokens, remaining)
         logits, memory = self.prefill(tokens)
         for i in range(max_new_tokens):
             next_token = self._sample(logits[:, -1], temperature, top_p, top_k)

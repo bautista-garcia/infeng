@@ -1,4 +1,4 @@
 from .inference import InferenceEngine
-from .memory import Memory, RequestMemory
+from .memory import Memory
 
-__all__ = ["InferenceEngine", "Memory", "RequestMemory"]
+__all__ = ["InferenceEngine", "Memory"]
