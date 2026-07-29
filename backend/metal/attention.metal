@@ -82,11 +82,21 @@ kernel void attention_prefill(
     }
 }
 
-static inline __attribute__((always_inline)) void prepare_decode_qk(
-        device const half* qg, device const half* raw_k, device half* cache_k,
-        device const float* q_weight, device const float* k_weight, device const half2* rope,
-        threadgroup half* q, threadgroup half* current_k, threadgroup float* inv_rms,
-        uint h, uint kvh, uint context, uint capacity, bool write_k, uint lane, uint simd_group) {
+[[max_total_threads_per_threadgroup(128)]]
+kernel void attention_decode_scan(
+        device float* output [[buffer(0)]], device const half* qg [[buffer(1)]],
+        device const half* raw_k [[buffer(2)]], device half* cache_k [[buffer(3)]],
+        device const half* cache_v [[buffer(4)]], device const float* q_weight [[buffer(5)]],
+        device const float* k_weight [[buffer(6)]], device const half2* rope [[buffer(7)]],
+        constant uint& context [[buffer(8)]], constant uint& capacity [[buffer(9)]],
+        constant uint& splits [[buffer(10)]], uint lane [[thread_index_in_simdgroup]],
+        uint simd_group [[simdgroup_index_in_threadgroup]],
+        uint3 group3 [[threadgroup_position_in_grid]]) {
+    uint h = group3.x / splits, split = group3.x % splits, kvh = h / GROUPS, total = context + 1;
+    uint begin = (total * split) / splits, end = (total * (split + 1)) / splits;
+    threadgroup half q[HEAD_DIM], current_k[HEAD_DIM];
+    threadgroup float partial[SCORE_GROUPS][HEAD_DIM], local_max[SCORE_GROUPS], local_norm[SCORE_GROUPS];
+    threadgroup float global_max, global_norm, inv_rms[2];
     if (simd_group == 0) {
         float q2 = 0.0f, k2 = 0.0f;
         for (uint d = lane; d < HEAD_DIM; d += 32) {
@@ -119,28 +129,9 @@ static inline __attribute__((always_inline)) void prepare_decode_qk(
         current_k[lane + 32] = half(fma(k1, float(cs.x), k0 * float(cs.y)));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (write_k && simd_group == 0)
+    if (split == 0 && h % GROUPS == 0 && simd_group == 0)
         for (uint d = lane; d < HEAD_DIM; d += 32)
             cache_k[(kvh * capacity + context) * HEAD_DIM + d] = current_k[d];
-}
-
-[[max_total_threads_per_threadgroup(128)]]
-kernel void attention_decode_scan(
-        device float* output [[buffer(0)]], device const half* qg [[buffer(1)]],
-        device const half* raw_k [[buffer(2)]], device half* cache_k [[buffer(3)]],
-        device const half* cache_v [[buffer(4)]], device const float* q_weight [[buffer(5)]],
-        device const float* k_weight [[buffer(6)]], device const half2* rope [[buffer(7)]],
-        constant uint& context [[buffer(8)]], constant uint& capacity [[buffer(9)]],
-        constant uint& splits [[buffer(10)]], uint lane [[thread_index_in_simdgroup]],
-        uint simd_group [[simdgroup_index_in_threadgroup]],
-        uint3 group3 [[threadgroup_position_in_grid]]) {
-    uint h = group3.x / splits, split = group3.x % splits, kvh = h / GROUPS, total = context + 1;
-    uint begin = (total * split) / splits, end = (total * (split + 1)) / splits;
-    threadgroup half q[HEAD_DIM], current_k[HEAD_DIM];
-    threadgroup float partial[SCORE_GROUPS][HEAD_DIM], local_max[SCORE_GROUPS], local_norm[SCORE_GROUPS];
-    threadgroup float global_max, global_norm, inv_rms[2];
-    prepare_decode_qk(qg, raw_k, cache_k, q_weight, k_weight, rope, q, current_k, inv_rms,
-                      h, kvh, context, capacity, split == 0 && h % GROUPS == 0, lane, simd_group);
 
     float max_value = -INFINITY, norm = 0.0f, acc[HEAD_DIM / 32] = {0.0f};
     for (uint token = begin + simd_group; token < end; token += SCORE_GROUPS) {
