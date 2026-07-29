@@ -260,6 +260,9 @@ def main():
     buffers = (make_quant_buffers(device, a.quant_type, a.k, a.n, block_bytes, a.m, a.random_seed)
                if a.kind == "prefill" else make_quant_buffers(device, a.quant_type, a.k, a.n, block_bytes,
                                                                random_seed=a.random_seed))
+    if a.kind == "decode":
+        zero = fill_buffer(device, struct.pack("I", 0))
+        buffers = (*buffers, buffers[0], zero, zero, zero)
     queue = device.newCommandQueue()
     stem = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{a.kernel}"
     trace, results = None, None
@@ -274,7 +277,7 @@ def main():
                 baseline_lib.newFunctionWithName_(a.kernel), None)
             output_elements = a.n if a.kind == "decode" else a.m * a.n
             baseline_y = device.newBufferWithLength_options_(output_elements * 2, 0)
-            baseline_buffers = (baseline_y, *buffers[1:])
+            baseline_buffers = (baseline_y, *buffers[1:3], baseline_y, *buffers[4:])
             dispatch(queue, baseline_pipe, baseline_buffers, baseline_threads, baseline_tg, dispatch_m)
             dispatch(queue, pipe, buffers, threads, tg, dispatch_m)
             correctness = compare_outputs(baseline_y, buffers[0], output_elements)

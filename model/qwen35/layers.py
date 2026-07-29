@@ -143,7 +143,13 @@ class FullAttention(nn.Module):
         self.rotary_emb = RotaryEmbedding(config)
         self.attention_metal = get_attention_kernels()
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, memory: Any,
+                residual: torch.Tensor | None = None) -> torch.Tensor:
+        if hidden_states.shape[1] == 1:
+            assert residual is not None
+            return self.attention_metal.decode_layer(
+                hidden_states, residual, memory, self.q_proj.weight, self.k_proj.weight, self.v_proj.weight,
+                self.o_proj.weight, self.q_norm.weight.data, self.k_norm.weight.data)
         batch_size, seq_len, _ = hidden_states.shape
         q_and_gate = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim * 2)
         query_states, gate = torch.chunk(q_and_gate, 2, dim=-1)
@@ -158,8 +164,8 @@ class FullAttention(nn.Module):
             memory.buffer = key_states.new_empty((2, batch_size, self.num_key_value_heads,
                                                   memory.max_context, self.head_dim))
         cache_keys, cache_values = memory.buffer
-        attn_output = self.attention_metal(query_states, key_states, value_states, cache_keys, cache_values,
-                                           memory.length)
+        attn_output = self.attention_metal.prefill(query_states, key_states, value_states, cache_keys, cache_values,
+                                                   memory.length)
         memory.length += seq_len
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
         attn_output = attn_output * torch.sigmoid(gate)
@@ -248,9 +254,9 @@ class DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         attn = getattr(self, self._attn_name)
-        hidden_states = attn(hidden_states, position_ids, memory)
-
-        hidden_states = residual + hidden_states
+        fused_decode = self._attn_name == "self_attn" and hidden_states.shape[1] == 1
+        hidden_states = attn(hidden_states, position_ids, memory, residual) if fused_decode else (
+            residual + attn(hidden_states, position_ids, memory))
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)

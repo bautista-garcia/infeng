@@ -10,6 +10,10 @@ class KVCache:
     max_context: int
     buffer: torch.Tensor | None = None
     length: int = 0
+    qg: torch.Tensor | None = None
+    raw_k: torch.Tensor | None = None
+    attention: torch.Tensor | None = None
+    partials: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
