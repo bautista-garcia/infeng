@@ -3,207 +3,223 @@ using namespace metal;
 
 constant uint Q_HEADS = 16;
 constant uint KV_HEADS = 4;
-constant uint GROUPS = Q_HEADS / KV_HEADS;
+constant uint Q_HEADS_PER_KV_HEAD = Q_HEADS / KV_HEADS;
 constant uint HEAD_DIM = 256;
-constant uint SCORE_GROUPS = 4;
+constant uint SIMDGROUPS_PER_THREADGROUP = 4;
 
 [[max_total_threads_per_threadgroup(128)]]
 kernel void attention_prefill(
-        device half* output [[buffer(0)]], device const half* query [[buffer(1)]],
-        device const half* current_k [[buffer(2)]], device const half* current_v [[buffer(3)]],
+        device half* output [[buffer(0)]], device const half* q [[buffer(1)]],
+        device const half* k [[buffer(2)]], device const half* v [[buffer(3)]],
         device half* cache_k [[buffer(4)]], device half* cache_v [[buffer(5)]],
         constant long& batch_size [[buffer(6)]], constant long& seq_len [[buffer(7)]],
         constant long& context_length [[buffer(8)]], constant long& cache_capacity [[buffer(9)]],
-        uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
-        uint3 group3 [[threadgroup_position_in_grid]]) {
-    uint group = group3.x, h = group % Q_HEADS, row = group / Q_HEADS;
-    uint qpos = row % uint(seq_len), b = row / uint(seq_len), kvh = h / GROUPS;
-    if (b >= uint(batch_size)) return;
-    uint old_length = uint(context_length), total_length = old_length + qpos + 1;
-    uint q_offset = ((b * uint(seq_len) + qpos) * Q_HEADS + h) * HEAD_DIM;
+        uint simd_lane [[thread_index_in_simdgroup]], uint simd_index [[simdgroup_index_in_threadgroup]],
+        uint3 threadgroup_position [[threadgroup_position_in_grid]]) {
+    uint q_head = threadgroup_position.x % Q_HEADS, row = threadgroup_position.x / Q_HEADS;
+    uint q_position = row % uint(seq_len), batch = row / uint(seq_len);
+    uint kv_head = q_head / Q_HEADS_PER_KV_HEAD;
+    if (batch >= uint(batch_size)) return;
+    uint cached_tokens = uint(context_length), attended_tokens = cached_tokens + q_position + 1;
+    uint q_offset = ((batch * uint(seq_len) + q_position) * Q_HEADS + q_head) * HEAD_DIM;
     threadgroup half q_shared[HEAD_DIM];
-    threadgroup float partial[SCORE_GROUPS][HEAD_DIM];
-    threadgroup float local_max[SCORE_GROUPS], local_norm[SCORE_GROUPS], global_max, global_norm;
+    threadgroup float simd_numerator[SIMDGROUPS_PER_THREADGROUP][HEAD_DIM];
+    threadgroup float simd_max[SIMDGROUPS_PER_THREADGROUP], simd_norm[SIMDGROUPS_PER_THREADGROUP];
+    threadgroup float attention_max, attention_norm;
 
-    if (simd_group == 0) {
-        for (uint d = simd_lane; d < HEAD_DIM; d += 32) q_shared[d] = query[q_offset + d];
-        if (h % GROUPS == 0) {
-            uint cache_offset = ((b * KV_HEADS + kvh) * uint(cache_capacity) + old_length + qpos) * HEAD_DIM;
-            uint current_offset = ((b * uint(seq_len) + qpos) * KV_HEADS + kvh) * HEAD_DIM;
-            for (uint d = simd_lane; d < HEAD_DIM; d += 32) {
-                cache_k[cache_offset + d] = current_k[current_offset + d];
-                cache_v[cache_offset + d] = current_v[current_offset + d];
+    if (simd_index == 0) {
+        for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32) q_shared[dim] = q[q_offset + dim];
+        if (q_head % Q_HEADS_PER_KV_HEAD == 0) {
+            uint cache_offset = ((batch * KV_HEADS + kv_head) * uint(cache_capacity)
+                                 + cached_tokens + q_position) * HEAD_DIM;
+            uint token_offset = ((batch * uint(seq_len) + q_position) * KV_HEADS + kv_head) * HEAD_DIM;
+            for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32) {
+                cache_k[cache_offset + dim] = k[token_offset + dim];
+                cache_v[cache_offset + dim] = v[token_offset + dim];
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float max_value = -1.0e30f, norm = 0.0f, acc[HEAD_DIM / 32] = {0.0f};
-    for (uint token = simd_group; token < total_length; token += SCORE_GROUPS) {
-        bool current = token >= old_length;
-        uint kv_offset = current
-            ? ((b * uint(seq_len) + token - old_length) * KV_HEADS + kvh) * HEAD_DIM
-            : ((b * KV_HEADS + kvh) * uint(cache_capacity) + token) * HEAD_DIM;
-        float dot_qk = 0.0f;
-        for (uint d = simd_lane; d < HEAD_DIM; d += 32)
-            dot_qk = fma(float(q_shared[d]), float(current ? current_k[kv_offset + d] : cache_k[kv_offset + d]),
-                         dot_qk);
-        dot_qk = simd_sum(dot_qk) * (1.0f / 16.0f);
-        float next_max = max(max_value, dot_qk), scale = exp(max_value - next_max), weight = exp(dot_qk - next_max);
-        norm = norm * scale + weight;
-        for (uint d = simd_lane, i = 0; d < HEAD_DIM; d += 32, ++i) {
-            float v = float(current ? current_v[kv_offset + d] : cache_v[kv_offset + d]);
-            acc[i] = fma(acc[i], scale, weight * v);
+    float running_max = -1.0e30f, running_norm = 0.0f, numerator[HEAD_DIM / 32] = {0.0f};
+    for (uint token = simd_index; token < attended_tokens; token += SIMDGROUPS_PER_THREADGROUP) {
+        bool current_chunk = token >= cached_tokens;
+        uint kv_offset = current_chunk
+            ? ((batch * uint(seq_len) + token - cached_tokens) * KV_HEADS + kv_head) * HEAD_DIM
+            : ((batch * KV_HEADS + kv_head) * uint(cache_capacity) + token) * HEAD_DIM;
+        float score = 0.0f;
+        for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32)
+            score = fma(float(q_shared[dim]), float(current_chunk ? k[kv_offset + dim] : cache_k[kv_offset + dim]),
+                        score);
+        score = simd_sum(score) * (1.0f / 16.0f);
+        float next_max = max(running_max, score), scale = exp(running_max - next_max);
+        float weight = exp(score - next_max);
+        running_norm = running_norm * scale + weight;
+        for (uint dim = simd_lane, i = 0; dim < HEAD_DIM; dim += 32, ++i) {
+            float value = float(current_chunk ? v[kv_offset + dim] : cache_v[kv_offset + dim]);
+            numerator[i] = fma(numerator[i], scale, weight * value);
         }
-        max_value = next_max;
+        running_max = next_max;
     }
     if (simd_lane == 0) {
-        local_max[simd_group] = max_value;
-        local_norm[simd_group] = norm;
+        simd_max[simd_index] = running_max;
+        simd_norm[simd_index] = running_norm;
     }
-    for (uint d = simd_lane, i = 0; d < HEAD_DIM; d += 32, ++i) partial[simd_group][d] = acc[i];
+    for (uint dim = simd_lane, i = 0; dim < HEAD_DIM; dim += 32, ++i)
+        simd_numerator[simd_index][dim] = numerator[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (simd_group == 0 && simd_lane == 0) {
-        global_max = local_max[0];
-        for (uint s = 1; s < SCORE_GROUPS; ++s) global_max = max(global_max, local_max[s]);
-        global_norm = 0.0f;
-        for (uint s = 0; s < SCORE_GROUPS; ++s) global_norm += local_norm[s] * exp(local_max[s] - global_max);
+    if (simd_index == 0 && simd_lane == 0) {
+        attention_max = simd_max[0];
+        for (uint s = 1; s < SIMDGROUPS_PER_THREADGROUP; ++s) attention_max = max(attention_max, simd_max[s]);
+        attention_norm = 0.0f;
+        for (uint s = 0; s < SIMDGROUPS_PER_THREADGROUP; ++s)
+            attention_norm += simd_norm[s] * exp(simd_max[s] - attention_max);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (simd_group == 0) {
-        for (uint d = simd_lane; d < HEAD_DIM; d += 32) {
+    if (simd_index == 0) {
+        for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32) {
             float value = 0.0f;
-            for (uint s = 0; s < SCORE_GROUPS; ++s)
-                value += partial[s][d] * exp(local_max[s] - global_max);
-            output[q_offset + d] = half(value / global_norm);
+            for (uint s = 0; s < SIMDGROUPS_PER_THREADGROUP; ++s)
+                value += simd_numerator[s][dim] * exp(simd_max[s] - attention_max);
+            output[q_offset + dim] = half(value / attention_norm);
         }
     }
 }
 
 [[max_total_threads_per_threadgroup(128)]]
 kernel void attention_decode_scan(
-        device float* output [[buffer(0)]], device const half* qg [[buffer(1)]],
-        device const half* raw_k [[buffer(2)]], device half* cache_k [[buffer(3)]],
-        device const half* cache_v [[buffer(4)]], device const float* q_weight [[buffer(5)]],
-        device const float* k_weight [[buffer(6)]], device const half2* rope [[buffer(7)]],
-        constant uint& context [[buffer(8)]], constant uint& capacity [[buffer(9)]],
-        constant uint& splits [[buffer(10)]], uint lane [[thread_index_in_simdgroup]],
-        uint simd_group [[simdgroup_index_in_threadgroup]],
-        uint3 group3 [[threadgroup_position_in_grid]]) {
-    uint h = group3.x / splits, split = group3.x % splits, kvh = h / GROUPS, total = context + 1;
-    uint begin = (total * split) / splits, end = (total * (split + 1)) / splits;
-    threadgroup half q[HEAD_DIM], current_k[HEAD_DIM];
-    threadgroup float partial[SCORE_GROUPS][HEAD_DIM], local_max[SCORE_GROUPS], local_norm[SCORE_GROUPS];
-    threadgroup float global_max, global_norm, inv_rms[2];
-    if (simd_group == 0) {
-        float q2 = 0.0f, k2 = 0.0f;
-        for (uint d = lane; d < HEAD_DIM; d += 32) {
-            float qv = float(qg[h * HEAD_DIM * 2 + d]), kv = float(raw_k[kvh * HEAD_DIM + d]);
-            q2 = fma(qv, qv, q2);
-            k2 = fma(kv, kv, k2);
-        }
-        q2 = simd_sum(q2);
-        k2 = simd_sum(k2);
-        if (lane == 0) {
-            inv_rms[0] = rsqrt(q2 / float(HEAD_DIM) + 1.0e-6f);
-            inv_rms[1] = rsqrt(k2 / float(HEAD_DIM) + 1.0e-6f);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_group == 0) {
-        for (uint d = lane; d < HEAD_DIM; d += 32) {
-            q[d] = half(float(qg[h * HEAD_DIM * 2 + d]) * inv_rms[0] * q_weight[d]);
-            current_k[d] = half(float(raw_k[kvh * HEAD_DIM + d]) * inv_rms[1] * k_weight[d]);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_group == 0 && lane < 32) {
-        half2 cs = rope[context * 32 + lane];
-        float q0 = float(q[lane]), q1 = float(q[lane + 32]);
-        float k0 = float(current_k[lane]), k1 = float(current_k[lane + 32]);
-        q[lane] = half(fma(q0, float(cs.x), -q1 * float(cs.y)));
-        q[lane + 32] = half(fma(q1, float(cs.x), q0 * float(cs.y)));
-        current_k[lane] = half(fma(k0, float(cs.x), -k1 * float(cs.y)));
-        current_k[lane + 32] = half(fma(k1, float(cs.x), k0 * float(cs.y)));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (split == 0 && h % GROUPS == 0 && simd_group == 0)
-        for (uint d = lane; d < HEAD_DIM; d += 32)
-            cache_k[(kvh * capacity + context) * HEAD_DIM + d] = current_k[d];
+        device float* split_partials [[buffer(0)]], device const half* projected_q_and_gate [[buffer(1)]],
+        device const half* projected_k [[buffer(2)]], device half* cache_k [[buffer(3)]],
+        device const half* cache_v [[buffer(4)]], device const float* q_norm_weight [[buffer(5)]],
+        device const float* k_norm_weight [[buffer(6)]], device const half2* rope_table [[buffer(7)]],
+        constant uint& current_position [[buffer(8)]], constant uint& cache_capacity [[buffer(9)]],
+        constant uint& num_splits [[buffer(10)]], uint simd_lane [[thread_index_in_simdgroup]],
+        uint simd_index [[simdgroup_index_in_threadgroup]],
+        uint3 threadgroup_position [[threadgroup_position_in_grid]]) {
+    uint q_head = threadgroup_position.x / num_splits, split = threadgroup_position.x % num_splits;
+    uint kv_head = q_head / Q_HEADS_PER_KV_HEAD, attended_tokens = current_position + 1;
+    uint split_begin = (attended_tokens * split) / num_splits;
+    uint split_end = (attended_tokens * (split + 1)) / num_splits;
+    threadgroup half q[HEAD_DIM], k[HEAD_DIM];
+    threadgroup float simd_numerator[SIMDGROUPS_PER_THREADGROUP][HEAD_DIM];
+    threadgroup float simd_max[SIMDGROUPS_PER_THREADGROUP], simd_norm[SIMDGROUPS_PER_THREADGROUP];
+    threadgroup float split_max, split_norm;
 
-    float max_value = -INFINITY, norm = 0.0f, acc[HEAD_DIM / 32] = {0.0f};
-    for (uint token = begin + simd_group; token < end; token += SCORE_GROUPS) {
-        uint offset = (kvh * capacity + token) * HEAD_DIM;
-        float dot_qk = 0.0f;
-        for (uint d = lane; d < HEAD_DIM; d += 32) {
-            float k = token == context ? float(current_k[d]) : float(cache_k[offset + d]);
-            dot_qk = fma(float(q[d]), k, dot_qk);
-        }
-        dot_qk = simd_sum(dot_qk) * (1.0f / 16.0f);
-        float next_max = max(max_value, dot_qk), scale = exp(max_value - next_max);
-        float weight = exp(dot_qk - next_max);
-        norm = norm * scale + weight;
-        for (uint d = lane, i = 0; d < HEAD_DIM; d += 32, ++i)
-            acc[i] = fma(acc[i], scale, weight * float(cache_v[offset + d]));
-        max_value = next_max;
-    }
-    if (lane == 0) {
-        local_max[simd_group] = max_value;
-        local_norm[simd_group] = norm;
-    }
-    for (uint d = lane, i = 0; d < HEAD_DIM; d += 32, ++i) partial[simd_group][d] = acc[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_group == 0 && lane == 0) {
-        global_max = local_max[0];
-        for (uint s = 1; s < SCORE_GROUPS; ++s) global_max = max(global_max, local_max[s]);
-        global_norm = 0.0f;
-        for (uint s = 0; s < SCORE_GROUPS; ++s) global_norm += local_norm[s] * exp(local_max[s] - global_max);
+    if (simd_index < 2) {
+        // simd 0 does (q,gate) and simd 1 does k
+        device const half* projected = simd_index == 0
+            ? projected_q_and_gate + q_head * HEAD_DIM * 2
+            : projected_k + kv_head * HEAD_DIM;
+        device const float* norm_weight = simd_index == 0 ? q_norm_weight : k_norm_weight;
+        threadgroup half* prepared = simd_index == 0 ? q : k;
+        float sum_squared = 0.0f;
+        // compute norm factors
+        for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32)
+            sum_squared = fma(float(projected[dim]), float(projected[dim]), sum_squared);
+        float inv_rms = rsqrt(simd_sum(sum_squared) / float(HEAD_DIM) + 1.0e-6f);
+        // rmsnorm(q or k)
+        for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32)
+            prepared[dim] = half(float(projected[dim]) * inv_rms * norm_weight[dim]);
+        // rope(q or k)
+        half2 cos_sin = rope_table[current_position * 32 + simd_lane];
+        float x0 = float(prepared[simd_lane]), x1 = float(prepared[simd_lane + 32]);
+        prepared[simd_lane] = half(fma(x0, float(cos_sin.x), -x1 * float(cos_sin.y)));
+        prepared[simd_lane + 32] = half(fma(x1, float(cos_sin.x), x0 * float(cos_sin.y)));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint base = (h * splits + split) * (HEAD_DIM + 2);
-    if (simd_group == 0) {
-        for (uint d = lane; d < HEAD_DIM; d += 32) {
-            float value = 0.0f;
-            for (uint s = 0; s < SCORE_GROUPS; ++s) value += partial[s][d] * exp(local_max[s] - global_max);
-            output[base + d] = value;
+
+    float running_max = -INFINITY, running_norm = 0.0f, numerator[HEAD_DIM / 32] = {0.0f};
+    for (uint token = split_begin + simd_index; token < split_end; token += SIMDGROUPS_PER_THREADGROUP) {
+        uint cache_offset = (kv_head * cache_capacity + token) * HEAD_DIM;
+        // calculate score:  Q @ K [threadgroup_id * T/8 + (simd_id mod SIMDGROUPS_PER_THREADGROUP)]
+        float score = 0.0f;
+        for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32) {
+            float key = token == current_position ? float(k[dim]) : float(cache_k[cache_offset + dim]);
+            score = fma(float(q[dim]), key, score);
         }
-        if (lane == 0) {
-            output[base + HEAD_DIM] = global_max;
-            output[base + HEAD_DIM + 1] = global_norm;
+        score = simd_sum(score) * (1.0f / 16.0f);
+        // online softmax with the scores each simd owns (T/8)/SIMDGROUPS_PER_THREADGROUP
+        float next_max = max(running_max, score), scale = exp(running_max - next_max);
+        float weight = exp(score - next_max);
+        running_norm = running_norm * scale + weight;
+        // online_softmax(QK) @ V
+        for (uint dim = simd_lane, i = 0; dim < HEAD_DIM; dim += 32, ++i)
+            numerator[i] = fma(numerator[i], scale, weight * float(cache_v[cache_offset + dim]));
+        running_max = next_max;
+    }
+    // write the running max and norm for each simdgroup
+    if (simd_lane == 0) {
+        simd_max[simd_index] = running_max;
+        simd_norm[simd_index] = running_norm;
+    }
+    // cooperative write of simd max numerators (you need to adjust them with threadgroup's max)
+    for (uint dim = simd_lane, i = 0; dim < HEAD_DIM; dim += 32, ++i)
+        simd_numerator[simd_index][dim] = numerator[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_index == 0 && simd_lane == 0) {
+        // find threadgroups max -> max(ms0, ms1, ms2, ms3)
+        split_max = simd_max[0];
+        for (uint s = 1; s < SIMDGROUPS_PER_THREADGROUP; ++s) split_max = max(split_max, simd_max[s]);
+        // merge simd denominators (+correction -> inter simd)
+        split_norm = 0.0f;
+        for (uint s = 0; s < SIMDGROUPS_PER_THREADGROUP; ++s)
+            split_norm += simd_norm[s] * exp(simd_max[s] - split_max);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint split_offset = (q_head * num_splits + split) * (HEAD_DIM + 2);
+    if (simd_index == 0) {
+        for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32) {
+            // merge simd numerators
+            float split_numerator = 0.0f;
+            for (uint s = 0; s < SIMDGROUPS_PER_THREADGROUP; ++s)
+                split_numerator += simd_numerator[s][dim] * exp(simd_max[s] - split_max);
+            split_partials[split_offset + dim] = split_numerator;
+        }
+        if (simd_lane == 0) {
+            split_partials[split_offset + HEAD_DIM] = split_max;
+            split_partials[split_offset + HEAD_DIM + 1] = split_norm;
         }
     }
+    if (split == 0 && q_head % Q_HEADS_PER_KV_HEAD == 0 && simd_index == 0)
+        for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32)
+            cache_k[(kv_head * cache_capacity + current_position) * HEAD_DIM + dim] = k[dim];
 }
 
 [[max_total_threads_per_threadgroup(128)]]
 kernel void attention_decode_reduce(
-        device half* output [[buffer(0)]], device const float* partial [[buffer(1)]],
-        device const half* qg [[buffer(2)]], constant uint& splits [[buffer(3)]],
-        uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
-        uint3 group3 [[threadgroup_position_in_grid]]) {
-    uint h = group3.x;
-    threadgroup float split_max[16], global_max, global_norm;
-    if (simd_group == 0 && lane < splits)
-        split_max[lane] = partial[(h * splits + lane) * (HEAD_DIM + 2) + HEAD_DIM];
+        device half* gated_attention [[buffer(0)]], device const float* split_partials [[buffer(1)]],
+        device const half* projected_q_and_gate [[buffer(2)]], constant uint& num_splits [[buffer(3)]],
+        uint simd_lane [[thread_index_in_simdgroup]], uint simd_index [[simdgroup_index_in_threadgroup]],
+        uint3 threadgroup_position [[threadgroup_position_in_grid]]) {
+    uint q_head = threadgroup_position.x;
+    threadgroup float split_max[16], attention_max, attention_norm;
+    if (simd_index == 0 && simd_lane < num_splits)
+        split_max[simd_lane] = split_partials[(q_head * num_splits + simd_lane) * (HEAD_DIM + 2) + HEAD_DIM];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_group == 0 && lane == 0) {
-        global_max = split_max[0];
-        for (uint s = 1; s < splits; ++s) global_max = max(global_max, split_max[s]);
-        global_norm = 0.0f;
-        for (uint s = 0; s < splits; ++s) {
-            uint base = (h * splits + s) * (HEAD_DIM + 2);
-            global_norm += partial[base + HEAD_DIM + 1] * exp(split_max[s] - global_max);
+    if (simd_index == 0 && simd_lane == 0) {
+        attention_max = split_max[0];
+        for (uint split = 1; split < num_splits; ++split)
+            attention_max = max(attention_max, split_max[split]);
+        attention_norm = 0.0f;
+        for (uint split = 0; split < num_splits; ++split) {
+            uint split_offset = (q_head * num_splits + split) * (HEAD_DIM + 2);
+            // merge denominators (+ correction -> interthreadgroup)
+            attention_norm += split_partials[split_offset + HEAD_DIM + 1]
+                              * exp(split_max[split] - attention_max);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint d = simd_group * 32 + lane; d < HEAD_DIM; d += 128) {
-        float value = 0.0f;
-        for (uint s = 0; s < splits; ++s) {
-            uint base = (h * splits + s) * (HEAD_DIM + 2);
-            value += partial[base + d] * exp(split_max[s] - global_max);
+    // correction to numerators of each query head
+    for (uint dim = simd_index * 32 + simd_lane; dim < HEAD_DIM; dim += 128) {
+        float numerator = 0.0f;
+        for (uint split = 0; split < num_splits; ++split) {
+            uint split_offset = (q_head * num_splits + split) * (HEAD_DIM + 2);
+            numerator += split_partials[split_offset + dim] * exp(split_max[split] - attention_max);
         }
-        float gate = float(qg[h * HEAD_DIM * 2 + HEAD_DIM + d]);
-        output[h * HEAD_DIM + d] = half((value / global_norm) / (1.0f + exp(-gate)));
+        // gate and write (output projection is a standard quant decode)
+        float gate = float(projected_q_and_gate[q_head * HEAD_DIM * 2 + HEAD_DIM + dim]);
+        gated_attention[q_head * HEAD_DIM + dim] = half((numerator / attention_norm) / (1.0f + exp(-gate)));
     }
 }

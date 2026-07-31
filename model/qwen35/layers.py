@@ -26,7 +26,7 @@ class Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
-        y = F.linear(x, w.data) if w.torch_dtype else self.kernels.linear(x.contiguous(), w)
+        y = F.linear(x, w.data) if w.torch_dtype else self.kernels(x.contiguous(), w)
         return y if self.bias is None else y + self.bias.data
 
 
@@ -147,7 +147,7 @@ class FullAttention(nn.Module):
                 residual: torch.Tensor | None = None) -> torch.Tensor:
         if hidden_states.shape[1] == 1:
             assert residual is not None
-            return self.attention_metal.decode_layer(
+            return self.attention_metal.decode(
                 hidden_states, residual, memory, self.q_proj.weight, self.k_proj.weight, self.v_proj.weight,
                 self.o_proj.weight, self.q_norm.weight.data, self.k_norm.weight.data)
         batch_size, seq_len, _ = hidden_states.shape

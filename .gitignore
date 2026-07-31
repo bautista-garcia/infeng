@@ -60,8 +60,13 @@ skills-lock.json
 
 .agents/
 
+agents/
+
 profile/out/
 
 agentic_loop/
 
 llama-speedup/
+
+attention_decode_dataflow*
+

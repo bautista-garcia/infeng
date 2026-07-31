@@ -148,6 +148,7 @@ kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buff
 
 // DECODE KERNELS
 
+// decode gemv can: 1) write to kv cache, 2) fuse a residual add before store, 3) store
 static inline __attribute__((always_inline)) void decode_store(
         device half* dst, device const half* aux, float value, uint row,
         uint mode, uint context, uint capacity) {

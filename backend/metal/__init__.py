@@ -103,7 +103,7 @@ class AttentionKernels:
                                    group_size=[128, 1, 1])
         return output
 
-    def decode_layer(self, x: torch.Tensor, residual: torch.Tensor, memory: Any, q_weight: Any, k_weight: Any,
+    def decode(self, x: torch.Tensor, residual: torch.Tensor, memory: Any, q_weight: Any, k_weight: Any,
                      v_weight: Any, o_weight: Any, q_norm: torch.Tensor, k_norm: torch.Tensor) -> torch.Tensor:
         assert x.shape == (1, 1, 4096)
         if memory.buffer is None:
@@ -115,9 +115,9 @@ class AttentionKernels:
             memory.partials = torch.empty((16, 16, 258), dtype=torch.float32, device=x.device)
         cache_k, cache_v = memory.buffer
         quant = get_quant_linear_kernels()
-        quant.decode_into(memory.qg, x, q_weight)
-        quant.decode_into(memory.raw_k, x, k_weight)
-        quant.decode_into(cache_v, x, v_weight, mode=1, context=memory.length, capacity=memory.max_context)
+        quant.decode(x, q_weight, y=memory.qg)
+        quant.decode(x, k_weight, y=memory.raw_k)
+        quant.decode(x, v_weight, y=cache_v, mode=1, context=memory.length, capacity=memory.max_context)
         args = (memory.qg, memory.raw_k, cache_k, cache_v, q_norm, k_norm, self._rope(x.device, memory.max_context),
                 memory.length, memory.max_context)
         splits = min(_ATTENTION_SPLITS, memory.length + 1)
@@ -126,7 +126,7 @@ class AttentionKernels:
         self.lib.attention_decode_reduce(memory.attention, memory.partials, memory.qg, splits,
                                          threads=[16 * 128, 1, 1], group_size=[128, 1, 1])
         output = torch.empty_like(x)
-        quant.decode_into(output, memory.attention, o_weight, mode=2, aux=residual)
+        quant.decode(memory.attention, o_weight, y=output, mode=2, aux=residual)
         memory.length += 1
         return output
 
@@ -150,7 +150,7 @@ def get_attention_kernels() -> AttentionKernels:
 class QuantLinearKernels:
     lib: object
 
-    def linear(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
         return (self.decode if x.numel() // x.shape[-1] == 1 else self.prefill)(x, weight)
 
     def prefill(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
@@ -165,13 +165,11 @@ class QuantLinearKernels:
                                         group_size=[128, 1, 1])
         return y2[:m].reshape(*x.shape[:-1], n)
 
-    def decode(self, x: torch.Tensor, weight: Any) -> torch.Tensor:
-        y = torch.empty((*x.shape[:-1], weight.shape[0]), dtype=x.dtype, device=x.device)
-        return self.decode_into(y, x, weight)
-
-    def decode_into(self, y: torch.Tensor, x: torch.Tensor, weight: Any, *, mode: int = 0,
-                    aux: torch.Tensor | None = None, context: int = 0, capacity: int = 0) -> torch.Tensor:
+    def decode(self, x: torch.Tensor, weight: Any, y: torch.Tensor | None = None, *, mode: int = 0,
+               aux: torch.Tensor | None = None, context: int = 0, capacity: int = 0) -> torch.Tensor:
         k, n = x.shape[-1], weight.shape[0]
+        if y is None:
+            y = torch.empty((*x.shape[:-1], n), dtype=x.dtype, device=x.device)
         decode_name, _, decode_tg, decode_rows = QUANT_LINEAR_KERNELS[(weight.type_name, k, n)]
         getattr(self.lib, decode_name)(y, x, weight.data, y if aux is None else aux, mode, context, capacity,
                                        threads=[(n + decode_rows - 1) // decode_rows * decode_tg, 1, 1],
