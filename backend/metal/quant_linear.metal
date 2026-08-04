@@ -154,7 +154,7 @@ static inline __attribute__((always_inline)) void decode_store(
         uint mode, uint context, uint capacity) {
     if (mode == 1) {
         uint head = row >> 8, dim = row & 255;
-        dst[(head * capacity + context) * 256 + dim] = half(value);
+        dst[(((context >> 7) * 4 + head) * 128 + (context & 127)) * 256 + dim] = half(value);
     } else if (mode == 2) {
         dst[row] = half(value) + aux[row];
     } else {
@@ -475,7 +475,7 @@ kernel void decode_iq4xs(device half* dst [[buffer(0)]], device const half* src 
 }
 
 [[max_total_threads_per_threadgroup(256)]]
-kernel void q4_k_embed(device half* y [[buffer(0)]], device const long* ids [[buffer(1)]],
+kernel void q4_k_embed(device half* y [[buffer(0)]], device const int* ids [[buffer(1)]],
                        device const uchar* w [[buffer(2)]], constant long& T [[buffer(3)]],
                        constant long& K [[buffer(4)]], uint3 lane3 [[thread_position_in_threadgroup]],
                        uint3 group [[threadgroup_position_in_grid]]) {

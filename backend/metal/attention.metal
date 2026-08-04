@@ -7,6 +7,10 @@ constant uint Q_HEADS_PER_KV_HEAD = Q_HEADS / KV_HEADS;
 constant uint HEAD_DIM = 256;
 constant uint SIMDGROUPS_PER_THREADGROUP = 4;
 
+static inline uint kv_offset(uint head, uint token) {
+    return (((token >> 7) * KV_HEADS + head) * 128 + (token & 127)) * HEAD_DIM;
+}
+
 [[max_total_threads_per_threadgroup(128)]]
 kernel void attention_prefill(
         device half* output [[buffer(0)]], device const half* q [[buffer(1)]],
@@ -30,8 +34,7 @@ kernel void attention_prefill(
     if (simd_index == 0) {
         for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32) q_shared[dim] = q[q_offset + dim];
         if (q_head % Q_HEADS_PER_KV_HEAD == 0) {
-            uint cache_offset = ((batch * KV_HEADS + kv_head) * uint(cache_capacity)
-                                 + cached_tokens + q_position) * HEAD_DIM;
+            uint cache_offset = kv_offset(kv_head, cached_tokens + q_position);
             uint token_offset = ((batch * uint(seq_len) + q_position) * KV_HEADS + kv_head) * HEAD_DIM;
             for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32) {
                 cache_k[cache_offset + dim] = k[token_offset + dim];
@@ -44,19 +47,19 @@ kernel void attention_prefill(
     float running_max = -1.0e30f, running_norm = 0.0f, numerator[HEAD_DIM / 32] = {0.0f};
     for (uint token = simd_index; token < attended_tokens; token += SIMDGROUPS_PER_THREADGROUP) {
         bool current_chunk = token >= cached_tokens;
-        uint kv_offset = current_chunk
+        uint item_offset = current_chunk
             ? ((batch * uint(seq_len) + token - cached_tokens) * KV_HEADS + kv_head) * HEAD_DIM
-            : ((batch * KV_HEADS + kv_head) * uint(cache_capacity) + token) * HEAD_DIM;
+            : kv_offset(kv_head, token);
         float score = 0.0f;
         for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32)
-            score = fma(float(q_shared[dim]), float(current_chunk ? k[kv_offset + dim] : cache_k[kv_offset + dim]),
+            score = fma(float(q_shared[dim]), float(current_chunk ? k[item_offset + dim] : cache_k[item_offset + dim]),
                         score);
         score = simd_sum(score) * (1.0f / 16.0f);
         float next_max = max(running_max, score), scale = exp(running_max - next_max);
         float weight = exp(score - next_max);
         running_norm = running_norm * scale + weight;
         for (uint dim = simd_lane, i = 0; dim < HEAD_DIM; dim += 32, ++i) {
-            float value = float(current_chunk ? v[kv_offset + dim] : cache_v[kv_offset + dim]);
+            float value = float(current_chunk ? v[item_offset + dim] : cache_v[item_offset + dim]);
             numerator[i] = fma(numerator[i], scale, weight * value);
         }
         running_max = next_max;
@@ -132,7 +135,7 @@ kernel void attention_decode_scan(
 
     float running_max = -INFINITY, running_norm = 0.0f, numerator[HEAD_DIM / 32] = {0.0f};
     for (uint token = split_begin + simd_index; token < split_end; token += SIMDGROUPS_PER_THREADGROUP) {
-        uint cache_offset = (kv_head * cache_capacity + token) * HEAD_DIM;
+        uint cache_offset = kv_offset(kv_head, token);
         // calculate score:  Q @ K [threadgroup_id * T/8 + (simd_id mod SIMDGROUPS_PER_THREADGROUP)]
         float score = 0.0f;
         for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32) {
@@ -184,7 +187,7 @@ kernel void attention_decode_scan(
     }
     if (split == 0 && q_head % Q_HEADS_PER_KV_HEAD == 0 && simd_index == 0)
         for (uint dim = simd_lane; dim < HEAD_DIM; dim += 32)
-            cache_k[(kv_head * cache_capacity + current_position) * HEAD_DIM + dim] = k[dim];
+            cache_k[kv_offset(kv_head, current_position) + dim] = k[dim];
 }
 
 [[max_total_threads_per_threadgroup(128)]]

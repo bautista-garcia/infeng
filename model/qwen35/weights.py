@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import mmap
+import math
 import struct
 import time
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import torch
+from backend.metal.runtime import Runtime, Tensor
 
 GGUF_TYPE_NAMES = {0: "F32", 1: "F16", 8: "Q8_0", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 23: "IQ4_XS", 30: "BF16"}
-GGUF_NATIVE_DTYPES = {0: torch.float32, 1: torch.float16, 30: torch.bfloat16}
+GGUF_NATIVE_DTYPES = {0: "f32", 1: "f16"}
 GGUF_BLOCK = {"Q8_0": (32, 34), "Q4_K": (256, 144), "Q5_K": (256, 176), "Q6_K": (256, 210), "IQ4_XS": (256, 136)}
 GGUF_VALUE_FORMATS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?",
                       10: "<Q", 11: "<q", 12: "<d"}
@@ -116,7 +117,7 @@ class QuantWeight:
     name: str
     shape: tuple[int, ...]
     gguf_type: int
-    data: torch.Tensor
+    data: Tensor
     offset: int
     nbytes: int
     block_size: int | None = None
@@ -128,7 +129,7 @@ class QuantWeight:
         return GGUF_TYPE_NAMES.get(self.gguf_type, str(self.gguf_type))
 
     @property
-    def torch_dtype(self) -> torch.dtype | None:
+    def native_dtype(self) -> str | None:
         return GGUF_NATIVE_DTYPES.get(self.gguf_type)
 
 
@@ -142,44 +143,48 @@ def _target(key: str) -> tuple[str, str | None] | None:
     return (f"model.layers.{parts[1]}.{attr}", GGUF_TRANSFORMS.get(attr)) if attr else None
 
 
-def _set(root: torch.nn.Module, dotted: str, value: QuantWeight):
-    obj = root
-    for part in dotted.split(".")[:-1]:
-        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
-    setattr(obj, dotted.rsplit(".", 1)[1], value)
-
-
-def load_weights(model: torch.nn.Module, path: str | Path) -> None:
+def load_weights(path: str | Path, runtime: Runtime) -> tuple[dict[str, QuantWeight], Tensor]:
     load_t0 = time.perf_counter()
     f, _, data_start, infos = _gguf(Path(path))
-    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    handles = getattr(model, "_gguf_handles", [])
-    handles.append((f, mm)); model._gguf_handles = handles
-    device, model_dtype = getattr(model, "device", None), getattr(model, "dtype", None)
-    # Loop through each layer's weights (reading metadata and getting file offsets to build mmaps)
+    mm, weights = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY), {}
+    selected, arena_size = [], 0
     for source_key, shape, typ, offset in infos:
         mapped = _target(source_key)
-        if mapped is None:
-            continue
+        if mapped is None: continue
         target_key, transform = mapped
-        if not hasattr(model.get_submodule(target_key.rsplit(".", 1)[0]), target_key.rsplit(".", 1)[1]):
-            continue
-        dtype = GGUF_NATIVE_DTYPES.get(typ)
-        # Torch dtype
-        if dtype:
-            numel = int(np.prod(shape))
-            data = torch.frombuffer(mm, dtype=dtype, count=numel, offset=data_start + offset).reshape(shape).to(device)
-            if transform == "neg_log":
-                data = torch.log(-data.float())
-            elif transform == "conv1d":
-                data = data[:, None, :].to(dtype=model_dtype or data.dtype)
-            shape = tuple(data.shape)
-            nbytes, block_size, block_bytes = numel * data.element_size(), None, None
-        # Quant dtype
+        if typ in GGUF_NATIVE_DTYPES:
+            nbytes = math.prod(shape) * (2 if transform == "conv1d" or typ == 1 else 4)
         else:
             block_size, block_bytes = GGUF_BLOCK[GGUF_TYPE_NAMES[typ]]
-            nbytes = int(np.prod(shape[:-1])) * (shape[-1] // block_size) * block_bytes
-            data = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes, offset=data_start + offset).to(device)
-        _set(model, target_key, QuantWeight(source_key, shape, typ, data,
-                                            data_start + offset, nbytes, block_size, block_bytes, transform))
+            nbytes = math.prod(shape[:-1]) * (shape[-1] // block_size) * block_bytes
+        arena_size = (arena_size + 255) & ~255; selected.append((source_key, shape, typ, offset, target_key,
+                                                                 transform, nbytes, arena_size))
+        arena_size += nbytes
+    arena = runtime.empty((arena_size,), "u8")
+    for source_key, shape, typ, offset, target_key, transform, expected_nbytes, arena_offset in selected:
+        dtype = GGUF_NATIVE_DTYPES.get(typ)
+        start = data_start + offset
+        if dtype is not None:
+            numel, itemsize = math.prod(shape), 4 if dtype == "f32" else 2
+            view = memoryview(mm)[start:start + numel * itemsize]
+            if transform == "neg_log":
+                values = array("f"); values.frombytes(view); values = array("f", (math.log(-x) for x in values))
+                view = memoryview(values)
+            if transform == "conv1d":
+                values = struct.unpack(f"<{numel}f", view)
+                view = memoryview(struct.pack(f"<{numel}e", *values)); dtype, itemsize = "f16", 2
+                shape = (shape[0], 1, shape[1])
+            nbytes, block_size, block_bytes = numel * itemsize, None, None
+        else:
+            block_size, block_bytes = GGUF_BLOCK[GGUF_TYPE_NAMES[typ]]
+            nbytes = math.prod(shape[:-1]) * (shape[-1] // block_size) * block_bytes
+            view = memoryview(mm)[start:start + nbytes]
+        if nbytes != expected_nbytes: raise ValueError(f"storage size mismatch for {source_key}")
+        runtime.upload_into(arena, arena_offset, view)
+        data = arena.view((nbytes,), offset=arena_offset)
+        weights[target_key] = QuantWeight(source_key, shape, typ, data, start, nbytes,
+                                          block_size, block_bytes, transform)
+        del view
+    mm.close(); f.close()
     print(f"GGUF weights loaded in {time.perf_counter() - load_t0:.3f}s")
+    return weights, arena

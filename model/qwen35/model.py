@@ -1,42 +1,41 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+import struct
+import time
 
-import torch
-from torch import nn
-
-from .layers import DecoderLayer, Embedding, LMHead, RMSNorm
-from .weights import config_from_gguf
-
-
-class TextModel(nn.Module):
-    def __init__(self, config: dict[str, Any]):
-        super().__init__()
-        self.config = config
-        self.embed_tokens = Embedding(self.config["vocab_size"], self.config["hidden_size"])
-        self.layers = nn.ModuleList(DecoderLayer(self.config, i) for i in range(self.config["num_hidden_layers"]))
-        self.norm = RMSNorm(self.config["hidden_size"], eps=self.config.get("rms_norm_eps", 1e-6))
-
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, memory: Any) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        for layer, layer_memory in zip(self.layers, memory.layers):
-            hidden_states = layer(hidden_states, position_ids, layer_memory)
-        return self.norm(hidden_states)
+from backend.metal.ops import Ops
+from backend.metal.runtime import Runtime
+from .layers import DecoderLayer
+from .weights import config_from_gguf, load_weights
 
 
-class ForCausalLM(nn.Module):
-    def __init__(self, weights: str | Path = "weights/Qwen3.5-9B-UD-Q4_K_XL.gguf"):
-        super().__init__()
-        self.device, self.dtype = torch.device("mps"), torch.float16
-        torch.set_default_dtype(self.dtype)
-        weights = Path(weights)
-        if weights.suffix != ".gguf":
-            raise ValueError(f"ForCausalLM only accepts .gguf weights, got {weights}")
-        self.config = config_from_gguf(weights)
-        with torch.device(self.device):
-            self.model = TextModel(self.config)
-            self.lm_head = LMHead(self.config["hidden_size"], self.config["vocab_size"])
+class ForCausalLM:
+    def __init__(self, weights: str | Path, runtime: Runtime, max_context: int):
+        path = Path(weights)
+        if path.suffix != ".gguf": raise ValueError(f"ForCausalLM only accepts .gguf weights, got {path}")
+        self.runtime, self.config, self.ops = runtime, config_from_gguf(path), Ops(runtime)
+        self.weights, self.weight_arena = load_weights(path, runtime)
+        self.layers = [DecoderLayer(self.config, i, self.weights, self.ops)
+                       for i in range(self.config["num_hidden_layers"])]
+        self.embedding = self.weights["model.embed_tokens.weight"]
+        self.norm = self.weights["model.norm.weight"]
+        self.head = self.weights["lm_head.weight"]
+        self.rope = runtime.empty((max_context, 32, 2), "f16")
+        self.token = runtime.empty((1,), "i32", shared=True)
+        self.rng = runtime.upload(struct.pack("<Q", time.time_ns() & 0xffffffffffffffff), (1,), "i64")
+        self.ops.begin()
+        self.ops.p.dispatch("init_rope", [self.rope], [("I", max_context), ("f", 10_000_000.0)],
+                            (((max_context * 32 + 255) // 256) * 256, 1, 1), (256, 1, 1))
+        self.ops.end()
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, memory: Any) -> torch.Tensor:
-        return self.lm_head(self.model(input_ids, position_ids, memory)[:, -1:])
+    def __call__(self, ids, memory, temperature=0.0, top_p=1.0, top_k=None):
+        seq, start = ids.numel, memory.length
+        self.ops.begin(); hidden = self.ops.embed(ids, self.embedding)
+        for layer, state in zip(self.layers, memory.layers): hidden = layer(hidden, state, start, self.rope)
+        last = hidden.view((1, 4096), offset=(seq - 1) * 4096)
+        last = self.ops.rms(last, self.norm, 1e-6, "model.norm")
+        logits = self.ops.linear(last, self.head, "model.logits")
+        self.ops.sample(logits, self.token, self.rng, temperature, top_p, top_k); self.ops.end()
+        memory.length += seq
+        return self.runtime.read_i32(self.token)

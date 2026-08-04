@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.build/
 *.egg
 .eggs/
 .ruff_cache/
@@ -69,4 +70,3 @@ agentic_loop/
 llama-speedup/
 
 attention_decode_dataflow*
-

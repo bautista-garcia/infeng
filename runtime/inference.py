@@ -1,79 +1,109 @@
 from __future__ import annotations
 
+import os
+import weakref
+from array import array
 from pathlib import Path
 
-import torch
-import torch.nn.functional as F
+os.environ.setdefault("USE_TORCH", "0")
 from transformers import AutoTokenizer
 
+from backend.metal.runtime import Runtime
 from model.qwen35.model import ForCausalLM
-from model.qwen35.weights import load_weights
 from .memory import GDNState, KVCache, Memory
 
 
-class InferenceEngine:
-    def __init__(self, weights: str | Path, tokenizer: str, *, max_context: int = 4096):
-        if not 0 < max_context <= 4096:
-            raise ValueError(f"max_context must be between 1 and 4096, got {max_context}")
-        self.device, self.dtype = torch.device("mps"), torch.float16
-        self.model = ForCausalLM(weights).eval()
-        load_weights(self.model, weights)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
-        self.max_context = max_context
-        self.paged_attention = self.prefix_cache = None
+class Session:
+    def __init__(self, engine: InferenceEngine):
+        self.engine, self.sparse = engine, engine.runtime.sparse_cache(engine.max_context)
+        layers, kv = [], 0
+        for index, kind in enumerate(engine.model.config["layer_types"]):
+            if kind == "full_attention":
+                layers.append(KVCache(self.sparse.buffers[2 * kv], self.sparse.buffers[2 * kv + 1],
+                                      engine.max_context)); kv += 1
+            else: layers.append(GDNState(index))
+        self.memory, self.transcript, self.closed = Memory(layers), [], False
+        self.ids = engine.runtime.empty((engine.max_context,), "i32", shared=True)
 
-    def _sample(self, logits: torch.Tensor, temperature: float = 0.0, top_p: float = 1.0,
-                top_k: int | None = None) -> torch.Tensor:
-        if temperature <= 0:
-            return logits.argmax(dim=-1, keepdim=True)
-        logits = logits.float() / temperature
-        if top_k:
-            logits = logits.masked_fill(logits < logits.topk(top_k).values[:, -1, None], -torch.inf)
-        if top_p < 1:
-            sorted_logits, sorted_idx = logits.sort(descending=True)
-            remove = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1) > top_p
-            remove[..., 1:], remove[..., 0] = remove[..., :-1].clone(), False
-            logits = logits.scatter(1, sorted_idx, sorted_logits.masked_fill(remove, -torch.inf))
-        return torch.multinomial(F.softmax(logits, dim=-1), 1)
+    def _tokens(self, messages, thinking):
+        if isinstance(messages, str): messages = [{"role": "user", "content": messages}]
+        template = getattr(self.engine.tokenizer, "apply_chat_template", None)
+        if template:
+            text = template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking)
+            if not thinking:
+                start, marker = "<|im_start|>assistant\n", "<think>\n\n</think>\n\n"
+                parts = text.split(start)
+                text = parts[0] + "".join(start + (part if part.startswith(marker) else marker + part)
+                                           for part in parts[1:])
+            return list(self.engine.tokenizer.encode(text, add_special_tokens=False))
+        return list(self.engine.tokenizer(messages[-1]["content"], add_special_tokens=False)["input_ids"])
 
-    def _run(self, input_ids: torch.Tensor, memory: Memory) -> tuple[torch.Tensor, Memory]:
-        cache = next(state for state in memory.layers if isinstance(state, KVCache))
-        end = cache.length + input_ids.shape[1]
-        if end > cache.max_context:
-            raise ValueError(f"context requires {end} tokens, but max_context is {cache.max_context}")
-        positions = torch.arange(cache.length, end, device=input_ids.device)[None].expand(input_ids.shape[0], -1)
-        return self.model(input_ids, positions, memory), memory
-
-    def prefill(self, input_ids: torch.Tensor, memory: Memory | None = None) -> tuple[torch.Tensor, Memory]:
-        if memory is None:
-            memory = Memory([KVCache(self.max_context) if t == "full_attention" else GDNState()
-                             for t in self.model.config["layer_types"]])
-        return self._run(input_ids, memory)
-
-    def decode(self, input_ids: torch.Tensor, memory: Memory) -> tuple[torch.Tensor, Memory]:
-        return self._run(input_ids, memory)
-
-    @torch.no_grad()
     def generate(self, messages: list[dict] | str, max_new_tokens: int | None = None, thinking: bool = False,
                  stop_token_ids: list[int] | None = None, temperature: float = 0.0, top_p: float = 1.0,
                  top_k: int | None = None):
-        if isinstance(messages, str):
-            messages = [{"role": "user", "content": messages}]
-        template = getattr(self.tokenizer, "apply_chat_template", None)
-        template_kwargs = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": thinking}
-        text = template(messages, **template_kwargs) if template else messages[-1]["content"]
-        tokens = self.tokenizer(text, return_tensors="pt").input_ids.to(self.device)
+        if self.closed: raise RuntimeError("session is closed")
+        canonical = self._tokens(messages, thinking)
+        if canonical[:len(self.transcript)] != self.transcript:
+            raise ValueError("message history does not extend the session token prefix")
+        self.transcript = canonical
+        suffix = canonical[self.memory.length:]
+        if not suffix: raise ValueError("message history adds no tokens to process")
+        remaining = self.engine.max_context - len(canonical)
+        count = remaining if max_new_tokens is None else min(max_new_tokens, remaining)
+        if count < 0: raise ValueError(f"context exceeds {self.engine.max_context} tokens")
         if stop_token_ids is None:
-            im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-            stop_token_ids = [t for t in (self.tokenizer.eos_token_id, im_end) if t is not None]
-        remaining = self.max_context - tokens.shape[1]
-        max_new_tokens = remaining if max_new_tokens is None else min(max_new_tokens, remaining)
-        logits, memory = self.prefill(tokens)
-        for i in range(max_new_tokens):
-            next_token = self._sample(logits[:, -1], temperature, top_p, top_k)
-            token_id = next_token.item()
-            if token_id in stop_token_ids:
-                break
-            yield token_id
-            if i + 1 < max_new_tokens:
-                logits, memory = self.decode(next_token, memory)
+            im_end = self.engine.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            stop_token_ids = [x for x in (self.engine.tokenizer.eos_token_id, im_end) if x is not None]
+        pending = suffix
+        for step in range(count):
+            end = self.memory.length + len(pending)
+            if end > self.engine.max_context:
+                raise ValueError(f"context requires {end} tokens, but max_context is {self.engine.max_context}")
+            self.sparse.ensure(end)
+            payload = array("i", pending); ids = self.ids.view((len(pending),))
+            self.engine.runtime.write(ids, payload)
+            token = self.engine.model(ids, self.memory, temperature, top_p, top_k); self.transcript.append(token)
+            if token in stop_token_ids: break
+            yield token
+            pending = [token]
+
+    @property
+    def mapped_kv_bytes(self): return self.sparse.mapped_bytes
+
+    def close(self):
+        if not self.closed: self.sparse.close(); self.closed = True
+
+    def __del__(self): self.close()
+
+
+class InferenceEngine:
+    def __init__(self, weights: str | Path, tokenizer: str, *, max_context: int = 65536, profile: bool = False):
+        if not 0 < max_context <= 65536: raise ValueError(f"max_context must be between 1 and 65536, got {max_context}")
+        self.runtime, self.max_context, self.profile = Runtime(profile), max_context, profile
+        self.device, self.dtype = "metal4", "float16"
+        self.model = ForCausalLM(weights, self.runtime, max_context)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+        self._session = None
+
+    def session(self):
+        live = self._session() if self._session else None
+        if live is not None and not live.closed: raise RuntimeError("only one live session is supported")
+        session = Session(self); self._session = weakref.ref(session); return session
+
+    def generate(self, *args, **kwargs):
+        live = self._session() if self._session else None
+        if live is None or live.closed: live = self.session()
+        return live.generate(*args, **kwargs)
+
+    def close(self):
+        live = self._session() if self._session else None
+        if live is not None: live.close()
+        if self.runtime: self.runtime.close(); self.runtime = None
+
+    def profile_counters(self):
+        counters = self.runtime.counters()
+        live = self._session() if self._session else None
+        if counters and live is not None and not live.closed: counters["mapped_kv_bytes"] = live.mapped_kv_bytes
+        return counters
+
+    def __del__(self): self.close()

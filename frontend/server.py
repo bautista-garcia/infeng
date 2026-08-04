@@ -13,6 +13,7 @@ from runtime import InferenceEngine  # noqa: E402
 class Handler(SimpleHTTPRequestHandler):
     root: Path
     engine = None
+    session = None
     loading = False
     args: argparse.Namespace
 
@@ -21,10 +22,11 @@ class Handler(SimpleHTTPRequestHandler):
         if Handler.engine is not None:
             return
         Handler.loading = True
-        print("loading model on mps with float16", flush=True)
+        print("loading model on native Metal 4 with float16", flush=True)
         Handler.engine = InferenceEngine(Handler.args.weights, Handler.args.tokenizer)
+        Handler.session = Handler.engine.session()
         Handler.loading = False
-        print(f"model loaded on {Handler.engine.device} with {Handler.engine.dtype}", flush=True)
+        print("model loaded on native Metal 4 with float16", flush=True)
 
     def do_GET(self):
         if self.path == "/":
@@ -36,7 +38,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "loading": Handler.loading,
                 "device": ""
                 if not loaded
-                else str(Handler.engine.device),
+                else "metal4",
             }
             payload = json.dumps(body).encode()
             self.send_response(200)
@@ -105,7 +107,7 @@ class Handler(SimpleHTTPRequestHandler):
             temperature = data.get("temperature", Handler.args.temperature)
             top_p = data.get("top_p", Handler.args.top_p)
             top_k = data.get("top_k", Handler.args.top_k)
-            gen = Handler.engine.generate(
+            gen = Handler.session.generate(
                 messages,
                 max_new_tokens=Handler.args.max_new_tokens,
                 thinking=thinking_enabled,
