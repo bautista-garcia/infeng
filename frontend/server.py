@@ -108,7 +108,7 @@ class Handler(SimpleHTTPRequestHandler):
             top_p = data.get("top_p", Handler.args.top_p)
             top_k = data.get("top_k", Handler.args.top_k)
             gen = Handler.session.generate(
-                messages,
+                messages[-1]["content"],
                 max_new_tokens=Handler.args.max_new_tokens,
                 thinking=thinking_enabled,
                 stop_token_ids=stop_ids,

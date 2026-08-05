@@ -22,38 +22,26 @@ class Session:
                 layers.append(KVCache(self.sparse.buffers[2 * kv], self.sparse.buffers[2 * kv + 1],
                                       engine.max_context)); kv += 1
             else: layers.append(GDNState(index))
-        self.memory, self.transcript, self.closed = Memory(layers), [], False
+        self.memory, self.transcript, self.closed, self.sealed = Memory(layers), [], False, True
         self.ids = engine.runtime.empty((engine.max_context,), "i32", shared=True)
 
-    def _tokens(self, messages, thinking):
-        if isinstance(messages, str): messages = [{"role": "user", "content": messages}]
-        template = getattr(self.engine.tokenizer, "apply_chat_template", None)
-        if template:
-            text = template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking)
-            if not thinking:
-                start, marker = "<|im_start|>assistant\n", "<think>\n\n</think>\n\n"
-                parts = text.split(start)
-                text = parts[0] + "".join(start + (part if part.startswith(marker) else marker + part)
-                                           for part in parts[1:])
-            return list(self.engine.tokenizer.encode(text, add_special_tokens=False))
-        return list(self.engine.tokenizer(messages[-1]["content"], add_special_tokens=False)["input_ids"])
+    def _tokens(self, message, thinking):
+        text = self.engine.tokenizer.apply_chat_template([{"role": "user", "content": message}], tokenize=False,
+                                                         add_generation_prompt=True, enable_thinking=thinking)
+        prefix = "" if not self.transcript else ("\n" if self.sealed else "<|im_end|>\n")
+        return list(self.engine.tokenizer.encode(prefix + text, add_special_tokens=False))
 
-    def generate(self, messages: list[dict] | str, max_new_tokens: int | None = None, thinking: bool = False,
+    def generate(self, message: str, max_new_tokens: int | None = None, thinking: bool = False,
                  stop_token_ids: list[int] | None = None, temperature: float = 0.0, top_p: float = 1.0,
                  top_k: int | None = None):
         if self.closed: raise RuntimeError("session is closed")
-        canonical = self._tokens(messages, thinking)
-        if canonical[:len(self.transcript)] != self.transcript:
-            raise ValueError("message history does not extend the session token prefix")
-        self.transcript = canonical
-        suffix = canonical[self.memory.length:]
-        if not suffix: raise ValueError("message history adds no tokens to process")
-        remaining = self.engine.max_context - len(canonical)
+        turn = self._tokens(message, thinking); self.transcript.extend(turn)
+        suffix = self.transcript[self.memory.length:]
+        remaining = self.engine.max_context - len(self.transcript)
         count = remaining if max_new_tokens is None else min(max_new_tokens, remaining)
         if count < 0: raise ValueError(f"context exceeds {self.engine.max_context} tokens")
-        if stop_token_ids is None:
-            im_end = self.engine.tokenizer.convert_tokens_to_ids("<|im_end|>")
-            stop_token_ids = [x for x in (self.engine.tokenizer.eos_token_id, im_end) if x is not None]
+        im_end = self.engine.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if stop_token_ids is None: stop_token_ids = [x for x in (self.engine.tokenizer.eos_token_id, im_end) if x is not None]
         pending = suffix
         for step in range(count):
             end = self.memory.length + len(pending)
@@ -63,9 +51,10 @@ class Session:
             payload = array("i", pending); ids = self.ids.view((len(pending),))
             self.engine.runtime.write(ids, payload)
             token = self.engine.model(ids, self.memory, temperature, top_p, top_k); self.transcript.append(token)
-            if token in stop_token_ids: break
+            if token in stop_token_ids: self.sealed = token == im_end; break
             yield token
             pending = [token]
+        else: self.sealed = False
 
     @property
     def mapped_kv_bytes(self): return self.sparse.mapped_bytes
