@@ -80,8 +80,9 @@ public:
 class SparseBuffers {
     static constexpr uint32_t count = 16, pageTokens = 128;
     static constexpr uint64_t pageBytes = 256ull << 10, heapBytes = 64ull << 20;
+    static constexpr uint32_t pagesPerHeap = heapBytes / (pageBytes * count);
     Device& device;
-    uint32_t mappedPages = 0;
+    uint32_t maxPages, mappedPages = 0;
     std::vector<Tensor> buffers;
     std::vector<MTL::Heap*> heaps;
     void addHeap();

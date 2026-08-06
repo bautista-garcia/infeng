@@ -120,7 +120,8 @@ Pass::~Pass() {
     if (encoder) try { encoder->endEncoding(); device.finish(false); } catch (...) {}
 }
 void Pass::commit() { encoder->endEncoding(); encoder = nullptr; device.finish(true); }
-SparseBuffers::SparseBuffers(Device& device, uint32_t maxContext) : device(device) {
+SparseBuffers::SparseBuffers(Device& device, uint32_t maxContext)
+    : device(device), maxPages(uint32_t((uint64_t(maxContext) + pageTokens - 1) / pageTokens)) {
     uint64_t bytes = uint64_t(maxContext) * 4 * 256 * 2; buffers.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         MTL::Buffer* buffer = device.value->newBuffer(bytes, MTL::ResourceStorageModePrivate, MTL::SparsePageSize256);
@@ -135,19 +136,19 @@ void SparseBuffers::addHeap() {
     descriptor->setMaxCompatiblePlacementSparsePageSize(MTL::SparsePageSize256);
     MTL::Heap* heap = device.value->newHeap(descriptor.get());
     if (!heap) throw std::runtime_error("KV heap allocation failed"); device.add(heap); heaps.push_back(heap);
+    // Allocate 64 MiB once, then issue sparse mappings per heap across all 16 buffers.
+    uint32_t pages = std::min(pagesPerHeap, maxPages - mappedPages);
+    MTL::Heap* mappingHeap = heaps.back();
+    for (uint32_t page = 0; page < pages; ++page) for (uint32_t i = 0; i < count; ++i) {
+        MTL4::UpdateSparseBufferMappingOperation operation{MTL::SparseTextureMappingModeMap,
+                                                           NS::Range::Make(mappedPages + page, 1), page * count + i};
+        device.queue->updateBufferMappings(buffers[i].buffer->value, mappingHeap, &operation, 1);
+    }
+    mappedPages += pages;
 }
 void SparseBuffers::ensure(uint32_t tokens) {
-    uint32_t target = (tokens + pageTokens - 1) / pageTokens, pagesPerHeap = heapBytes / pageBytes;
-    while (mappedPages < target) {
-        for (uint32_t i = 0; i < count; ++i) {
-            uint32_t tile = mappedPages * count + i, heapIndex = tile / pagesPerHeap, heapOffset = tile % pagesPerHeap;
-            while (heaps.size() <= heapIndex) addHeap();
-            MTL4::UpdateSparseBufferMappingOperation operation{MTL::SparseTextureMappingModeMap,
-                                                               NS::Range::Make(mappedPages, 1), heapOffset};
-            device.queue->updateBufferMappings(buffers[i].buffer->value, heaps[heapIndex], &operation, 1);
-        }
-        ++mappedPages;
-    }
+    uint32_t target = std::min(maxPages, uint32_t((uint64_t(tokens) + pageTokens - 1) / pageTokens));
+    while (mappedPages < target) addHeap();
 }
 SparseBuffers::~SparseBuffers() {
     for (uint32_t page = 0; page < mappedPages; ++page) for (uint32_t i = 0; i < count; ++i) {

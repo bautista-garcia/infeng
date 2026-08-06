@@ -177,6 +177,7 @@ Session::~Session() { model.sessionLive = false; }
 int32_t forward(Model& model, Session& session, const int32_t* ids, uint32_t seq,
                 float temperature, float topP, int32_t topK) {
     if (!seq || session.length + seq > model.maxContext) throw std::runtime_error("forward exceeds maximum context");
+    // ensure acts like a page fault if there isn't enough kv allocated
     model.device.write(session.inputIds, ids, uint64_t(seq) * sizeof(int32_t)); session.kv.ensure(session.length + seq);
     Scratch& scratch = model.scratch(seq); scratch.padRows = model.kernels.padRows; uint32_t chunks = (seq + 15) / 16;
     model.device.preparePass(uint64_t(512 + 24 * chunks) * 128, 512 + 24 * chunks);
