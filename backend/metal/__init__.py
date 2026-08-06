@@ -1,4 +1,3 @@
-from .ops import Ops
-from .runtime import Runtime, SparseCache, Tensor
+from .runtime import NativeModel, NativeSession
 
-__all__ = ["Ops", "Runtime", "SparseCache", "Tensor"]
+__all__ = ["NativeModel", "NativeSession"]
