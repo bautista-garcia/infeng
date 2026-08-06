@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.append(str(ROOT))
+sys.path.insert(0, str(ROOT))
 
 from runtime.inference import InferenceEngine
 
@@ -29,5 +29,5 @@ def test_greedy_multiturn_generation():
     assert first.strip() == FIRST_TURN_RESPONSE, repr(first)
     ours = engine.tokenizer.decode(list(session.generate("Bautista", max_new_tokens=64, thinking=False,
                                                           temperature=0.0)), skip_special_tokens=False)
-    session.close(); engine.close()
+    engine.close()
     assert ours.strip() == NATIVE_GREEDY_MULTITURN, repr(ours)

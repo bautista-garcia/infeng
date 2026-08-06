@@ -1,203 +1,108 @@
 from __future__ import annotations
 
 import ctypes
-import struct
 import subprocess
-from dataclasses import dataclass
+import weakref
+from array import array
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-LIB = ROOT / ".build/release/libInfengMetal.dylib"
+LIB = ROOT / ".build/libinfeng.dylib"
+KERNELS = ROOT / "backend/metal/kernel"
+SOURCES = [ROOT / "backend/metal/device.cpp", ROOT / "model/qwen35_weights.cpp", ROOT / "model/qwen35.cpp"]
+
+
+def _build():
+    headers = [*ROOT.glob("backend/metal/*.hpp"), *ROOT.glob("model/*.hpp"),
+               *(ROOT / "third_party/metal-cpp").rglob("*.hpp")]
+    if LIB.exists() and all(path.stat().st_mtime <= LIB.stat().st_mtime for path in [*SOURCES, *headers]): return
+    LIB.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["xcrun", "clang++", "-std=c++17", "-O3", "-DNDEBUG", "-fblocks", "-fvisibility=hidden",
+                    "-DMETALCPP_SYMBOL_VISIBILITY_HIDDEN", "-dynamiclib",
+                    *(str(path) for path in SOURCES), "-I", str(ROOT / "third_party/metal-cpp"), "-I", str(ROOT),
+                    "-framework", "Foundation", "-framework", "Metal", "-o", str(LIB)], check=True)
+
+
+class _Counters(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in
+                ("gpu_time_ns", "passes", "dispatches", "allocations", "allocated_bytes")]
 
 
 def _load():
-    if not LIB.exists():
-        subprocess.run(["swift", "build", "-c", "release"], cwd=ROOT, check=True)
-    lib = ctypes.CDLL(LIB)
+    _build(); lib = ctypes.CDLL(LIB)
     lib.infeng_last_error.restype = ctypes.c_char_p
-    lib.infeng_runtime_create.argtypes = (ctypes.c_int32,)
-    lib.infeng_runtime_create.restype = ctypes.c_void_p
-    lib.infeng_runtime_release.argtypes = (ctypes.c_void_p,)
-    lib.infeng_compile.argtypes = (ctypes.c_void_p, ctypes.c_char_p)
-    lib.infeng_buffer_create.argtypes = (ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int32)
-    lib.infeng_buffer_create.restype = ctypes.c_void_p
-    lib.infeng_buffer_upload.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64)
-    lib.infeng_buffer_upload.restype = ctypes.c_void_p
-    lib.infeng_buffer_write.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p,
-                                        ctypes.c_uint64)
-    lib.infeng_buffer_contents.argtypes = (ctypes.c_void_p,)
-    lib.infeng_buffer_contents.restype = ctypes.c_void_p
-    lib.infeng_buffer_read.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p,
-                                       ctypes.c_uint64)
-    lib.infeng_buffer_release.argtypes = (ctypes.c_void_p,)
-    lib.infeng_sparse_create.argtypes = (ctypes.c_void_p, ctypes.c_int32)
-    lib.infeng_sparse_create.restype = ctypes.c_void_p
-    lib.infeng_sparse_buffer.argtypes = (ctypes.c_void_p, ctypes.c_int32)
-    lib.infeng_sparse_buffer.restype = ctypes.c_void_p
-    lib.infeng_sparse_ensure.argtypes = (ctypes.c_void_p, ctypes.c_int32)
-    lib.infeng_sparse_mapped_bytes.argtypes = (ctypes.c_void_p,)
-    lib.infeng_sparse_mapped_bytes.restype = ctypes.c_uint64
-    lib.infeng_sparse_release.argtypes = (ctypes.c_void_p,)
-    lib.infeng_profile_gpu_ns.argtypes = (ctypes.c_void_p,)
-    lib.infeng_profile_gpu_ns.restype = ctypes.c_uint64
-    lib.infeng_profile_passes.argtypes = (ctypes.c_void_p,)
-    lib.infeng_profile_passes.restype = ctypes.c_uint64
-    lib.infeng_pass_begin.argtypes = (ctypes.c_void_p,)
-    lib.infeng_pass_begin.restype = ctypes.c_void_p
-    lib.infeng_dispatch.argtypes = (
-        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint64),
-        ctypes.c_int32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_int32,
-        ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
-    )
-    lib.infeng_pass_commit.argtypes = (ctypes.c_void_p, ctypes.c_int32)
+    lib.infeng_model_create.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_int32)
+    lib.infeng_model_create.restype = ctypes.c_void_p
+    lib.infeng_model_release.argtypes = (ctypes.c_void_p,)
+    lib.infeng_session_create.argtypes = (ctypes.c_void_p,); lib.infeng_session_create.restype = ctypes.c_void_p
+    lib.infeng_session_release.argtypes = (ctypes.c_void_p,)
+    lib.infeng_forward.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_uint32,
+                                   ctypes.c_float, ctypes.c_float, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32))
+    lib.infeng_session_length.argtypes = (ctypes.c_void_p,); lib.infeng_session_length.restype = ctypes.c_uint64
+    lib.infeng_session_mapped_bytes.argtypes = (ctypes.c_void_p,); lib.infeng_session_mapped_bytes.restype = ctypes.c_uint64
+    for name in ("infeng_model_parameter_count", "infeng_model_weight_bytes", "infeng_model_vocab_size"):
+        function = getattr(lib, name); function.argtypes = (ctypes.c_void_p,); function.restype = ctypes.c_uint64
+    lib.infeng_model_counters.argtypes = (ctypes.c_void_p, ctypes.POINTER(_Counters))
     return lib
 
 
 _LIB = _load()
 
 
+def _error(): return (_LIB.infeng_last_error() or b"native Metal operation failed").decode()
 def _check(value):
-    if value in (None, 0):
-        raise RuntimeError((_LIB.infeng_last_error() or b"Metal operation failed").decode())
+    if not value: raise RuntimeError(_error())
     return value
-
-
 def _status(value):
-    if value != 0: raise RuntimeError((_LIB.infeng_last_error() or b"Metal operation failed").decode())
+    if value: raise RuntimeError(_error())
 
 
-DTYPE_SIZE = {"u8": 1, "i32": 4, "i64": 8, "f16": 2, "f32": 4}
+class NativeSession:
+    def __init__(self, model: NativeModel):
+        self.handle, self.closed = _check(_LIB.infeng_session_create(model.handle)), False
 
-
-@dataclass(slots=True)
-class Tensor:
-    runtime: Runtime
-    handle: int
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    dtype: str
-    offset: int = 0
-    owner: bool = True
+    def forward(self, ids, temperature=0.0, top_p=1.0, top_k=None):
+        payload = array("i", ids); values = (ctypes.c_int32 * len(payload)).from_buffer(payload); output = ctypes.c_int32()
+        _status(_LIB.infeng_forward(self.handle, values, len(payload), temperature, top_p, top_k or 0,
+                                    ctypes.byref(output)))
+        return output.value
 
     @property
-    def numel(self):
-        n = 1
-        for dim in self.shape: n *= dim
-        return n
+    def length(self): return _LIB.infeng_session_length(self.handle)
 
     @property
-    def nbytes(self): return self.numel * DTYPE_SIZE[self.dtype]
-
-    def view(self, shape, strides=None, offset=0):
-        shape = tuple(shape)
-        if strides is None:
-            stride, strides = 1, []
-            for dim in reversed(shape): strides.append(stride); stride *= dim
-            strides = tuple(reversed(strides))
-        return Tensor(self.runtime, self.handle, shape, tuple(strides), self.dtype,
-                      self.offset + offset * DTYPE_SIZE[self.dtype], False)
-
-    def __del__(self):
-        if self.owner and getattr(self, "handle", 0): _LIB.infeng_buffer_release(ctypes.c_void_p(self.handle))
-
-
-class Runtime:
-    def __init__(self, profile=False):
-        self.profile, self.allocations, self.allocated_bytes, self.dispatches = profile, 0, 0, 0
-        self.handle = _check(_LIB.infeng_runtime_create(profile))
-        for path in sorted((ROOT / "backend/metal").glob("*.metal")):
-            _status(_LIB.infeng_compile(self.handle, path.read_bytes()))
-
-    def empty(self, shape, dtype="f16", shared=False):
-        shape = tuple(shape); n = DTYPE_SIZE[dtype]
-        for dim in shape: n *= dim
-        handle = _check(_LIB.infeng_buffer_create(self.handle, n, shared))
-        self.allocations += 1; self.allocated_bytes += n
-        return Tensor(self, handle, shape, self._strides(shape), dtype)
-
-    def upload(self, data, shape, dtype):
-        view = memoryview(data).cast("B")
-        source = (ctypes.c_ubyte * len(view)).from_buffer_copy(view)
-        handle = _check(_LIB.infeng_buffer_upload(self.handle, source, len(view)))
-        self.allocations += 1; self.allocated_bytes += len(view)
-        return Tensor(self, handle, tuple(shape), self._strides(shape), dtype)
-
-    def shared(self, data, shape, dtype):
-        tensor = self.empty(shape, dtype, shared=True)
-        view = memoryview(data).cast("B")
-        if len(view) != tensor.nbytes: raise ValueError(f"expected {tensor.nbytes} bytes, got {len(view)}")
-        ctypes.memmove(_check(_LIB.infeng_buffer_contents(tensor.handle)), bytes(view), len(view))
-        return tensor
-
-    def upload_into(self, tensor, offset, data):
-        view = memoryview(data).cast("B"); source = (ctypes.c_ubyte * len(view)).from_buffer_copy(view)
-        if offset + len(view) > tensor.nbytes: raise ValueError("arena upload exceeds buffer")
-        _status(_LIB.infeng_buffer_write(self.handle, tensor.handle, tensor.offset + offset, source, len(view)))
-
-    def read_i32(self, tensor):
-        if tensor.dtype != "i32" or tensor.numel != 1: raise ValueError("readback must be one i32")
-        return ctypes.c_int32.from_address(_check(_LIB.infeng_buffer_contents(tensor.handle))).value
-
-    def write(self, tensor, data):
-        view = memoryview(data).cast("B")
-        if len(view) > tensor.nbytes: raise ValueError(f"write requires {len(view)} bytes, buffer has {tensor.nbytes}")
-        ctypes.memmove(_check(_LIB.infeng_buffer_contents(tensor.handle)) + tensor.offset, bytes(view), len(view))
-
-    def read(self, tensor):
-        output = (ctypes.c_ubyte * tensor.nbytes)()
-        _status(_LIB.infeng_buffer_read(self.handle, tensor.handle, tensor.offset, output, tensor.nbytes))
-        return bytes(output)
-
-    def begin(self): return Pass(self, _check(_LIB.infeng_pass_begin(self.handle)))
-
-    def sparse_cache(self, max_context=65536): return SparseCache(self, max_context)
-
-    @staticmethod
-    def _strides(shape):
-        stride, out = 1, []
-        for dim in reversed(shape): out.append(stride); stride *= dim
-        return tuple(reversed(out))
+    def mapped_bytes(self): return _LIB.infeng_session_mapped_bytes(self.handle)
 
     def close(self):
-        if self.handle: _LIB.infeng_runtime_release(self.handle); self.handle = 0
+        if not self.closed: _LIB.infeng_session_release(self.handle); self.handle, self.closed = 0, True
+
+    def __del__(self): self.close()
+
+
+class NativeModel:
+    def __init__(self, weights: str | Path, *, max_context=65536, profile=False):
+        self._session = None
+        self.handle = _check(_LIB.infeng_model_create(str(weights).encode(), str(KERNELS).encode(), max_context, profile))
+
+    def session(self):
+        session = NativeSession(self); self._session = weakref.ref(session); return session
+
+    @property
+    def parameter_count(self): return _LIB.infeng_model_parameter_count(self.handle)
+
+    @property
+    def weight_bytes(self): return _LIB.infeng_model_weight_bytes(self.handle)
+
+    @property
+    def vocab_size(self): return _LIB.infeng_model_vocab_size(self.handle)
 
     def counters(self):
-        if not self.profile: return {}
-        return {"gpu_time_ns": _LIB.infeng_profile_gpu_ns(self.handle),
-                "passes": _LIB.infeng_profile_passes(self.handle), "dispatches": self.dispatches,
-                "allocations": self.allocations, "allocated_bytes": self.allocated_bytes}
-
-
-class Pass:
-    FORMATS = {"i": "i", "I": "I", "q": "q", "Q": "Q", "f": "f", "?": "?"}
-
-    def __init__(self, runtime, handle): self.runtime, self.handle = runtime, handle
-
-    def dispatch(self, name, tensors, scalars, threads, group):
-        self.runtime.dispatches += 1
-        buffers = (ctypes.c_void_p * len(tensors))(*(x.handle for x in tensors))
-        offsets = (ctypes.c_uint64 * len(tensors))(*(x.offset for x in tensors))
-        raw = b"".join(struct.pack("<" + fmt, value) for fmt, value in scalars)
-        sizes = (ctypes.c_uint32 * len(scalars))(*(struct.calcsize("<" + fmt) for fmt, _ in scalars))
-        payload = ctypes.create_string_buffer(raw)
-        _status(_LIB.infeng_dispatch(self.handle, name.encode(), buffers, offsets, len(tensors), payload, sizes,
-                                     len(scalars), *threads, *group))
-
-    def commit(self, wait=True): _status(_LIB.infeng_pass_commit(self.handle, wait)); self.handle = 0
-
-
-class SparseCache:
-    def __init__(self, runtime, max_context):
-        self.runtime, self.max_context = runtime, max_context
-        self.handle = _check(_LIB.infeng_sparse_create(runtime.handle, max_context))
-        shape = (max_context // 128, 4, 128, 256)
-        self.buffers = [Tensor(runtime, _LIB.infeng_sparse_buffer(self.handle, i), shape,
-                               Runtime._strides(shape), "f16", owner=False) for i in range(16)]
-
-    def ensure(self, tokens): _status(_LIB.infeng_sparse_ensure(self.handle, tokens))
-
-    @property
-    def mapped_bytes(self): return _LIB.infeng_sparse_mapped_bytes(self.handle)
+        output = _Counters(); _status(_LIB.infeng_model_counters(self.handle, ctypes.byref(output)))
+        return {name: getattr(output, name) for name, _ in output._fields_}
 
     def close(self):
-        if self.handle: _LIB.infeng_sparse_release(self.handle); self.handle = 0
+        live = self._session() if self._session else None
+        if live is not None: live.close()
+        if self.handle: _LIB.infeng_model_release(self.handle); self.handle = 0
+
+    def __del__(self): self.close()
