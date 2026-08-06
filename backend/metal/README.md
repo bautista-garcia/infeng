@@ -15,3 +15,13 @@ A complete 64 MiB heap therefore provides space for:
 ```
 
 When the model needs more KV-cache capacity, `ensure()` maps additional sparse-buffer pages to heap tiles. If the current heap has no remaining tiles, another 64 MiB heap is created and added to the residency set. The sparse buffers do not automatically request memory; the application explicitly grows them before dispatching kernels.
+
+## Kernel profiling
+
+Pass `profile=True` to `NativeModel` or run the standalone profiler to collect precise GPU timestamps around every forward-pass dispatch:
+
+```bash
+python benchmarks/profile_qwen35.py --prefill 128 --decode 32
+```
+
+The report aggregates by phase (`prefill` or `decode`) and pipeline name, including launch count, average GPU time per forward, and time share.

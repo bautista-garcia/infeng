@@ -101,4 +101,7 @@ INFENG_EXPORT uint64_t infeng_model_parameter_count(void* model);
 INFENG_EXPORT uint64_t infeng_model_weight_bytes(void* model);
 INFENG_EXPORT uint64_t infeng_model_vocab_size(void* model);
 INFENG_EXPORT int32_t infeng_model_counters(void* model, InfengCounters* output);
+INFENG_EXPORT uint32_t infeng_model_kernel_counter_count(void* model);
+INFENG_EXPORT int32_t infeng_model_kernel_counter(void* model, uint32_t index, const char** phase, const char** name,
+                                                  uint64_t* gpu_time_ns, uint64_t* launches);
 }

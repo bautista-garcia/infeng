@@ -180,7 +180,8 @@ int32_t forward(Model& model, Session& session, const int32_t* ids, uint32_t seq
     // ensure acts like a page fault if there isn't enough kv allocated
     model.device.write(session.inputIds, ids, uint64_t(seq) * sizeof(int32_t)); session.kv.ensure(session.length + seq);
     Scratch& scratch = model.scratch(seq); scratch.padRows = model.kernels.padRows; uint32_t chunks = (seq + 15) / 16;
-    CommandBuffer commands(model.device, uint64_t(512 + 24 * chunks) * 128);
+    CommandBuffer commands(model.device, uint64_t(512 + 24 * chunks) * 128, true, 1024 + 24 * chunks,
+                           seq == 1 ? "decode" : "prefill");
     commands.dispatch(model.kernels.embed, size(4096, seq), size(256),
                   {scratch.hidden[0], session.inputIds, model.embedding}, int64_t(seq), int64_t(4096));
     Tensor hidden = scratch.hidden[0];
@@ -191,7 +192,7 @@ int32_t forward(Model& model, Session& session, const int32_t* ids, uint32_t seq
     last = rms(commands, model, last, model.norm, scratch.modelNorm, 1, 4096);
     Tensor logits = linear(commands, last, model.head, 1, scratch.logits, scratch); sample(commands, model, session, logits, temperature, topP, topK);
     commands.commit(); session.length += seq;
-    return *static_cast<int32_t*>(session.token.buffer->value->contents());
+    return *static_cast<int32_t*>(session.token.buffer->metalBuffer->contents());
 }
 }  // namespace infeng::qwen35
 namespace {
@@ -225,5 +226,17 @@ uint64_t infeng_model_vocab_size(void*) { return 248320; }
 int32_t infeng_model_counters(void* pointer, InfengCounters* output) {
     return status([&] { const auto& counters = static_cast<infeng::qwen35::Model*>(pointer)->device.counters();
         *output = {counters.gpuTimeNs, counters.passes, counters.dispatches, counters.allocations, counters.allocatedBytes}; });
+}
+uint32_t infeng_model_kernel_counter_count(void* pointer) {
+    return static_cast<uint32_t>(static_cast<infeng::qwen35::Model*>(pointer)->device.kernelCounters().size());
+}
+int32_t infeng_model_kernel_counter(void* pointer, uint32_t index, const char** phase, const char** name,
+                                     uint64_t* gpuTimeNs, uint64_t* launches) {
+    return status([&] {
+        const auto& counters = static_cast<infeng::qwen35::Model*>(pointer)->device.kernelCounters();
+        if (index >= counters.size()) throw std::runtime_error("kernel counter index out of range");
+        const auto& counter = counters[index]; *phase = counter.phase.c_str(); *name = counter.name.c_str();
+        *gpuTimeNs = counter.gpuTimeNs; *launches = counter.launches;
+    });
 }
 }

@@ -70,6 +70,7 @@ class InferenceEngine:
     def profile_counters(self):
         if not self.profile: return {}
         counters = self.native.counters(); live = self._session() if self._session else None
+        counters["kernel_counters"] = self.native.kernel_counters()
         if live is not None and not live.closed: counters["mapped_kv_bytes"] = live.mapped_kv_bytes
         return counters
 
