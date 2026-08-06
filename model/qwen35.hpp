@@ -6,7 +6,7 @@
 #include <string>
 namespace infeng::qwen35 {
 using metal::Device;
-using metal::Pass;
+using metal::CommandBuffer;
 using metal::Pipeline;
 using metal::SparseBuffers;
 using metal::Tensor;

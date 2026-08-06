@@ -11,14 +11,18 @@ static std::string message(NS::Error* error) {
 }
 Buffer::~Buffer() { if (value) { device->remove(value); value->release(); } }
 Device::Device(const std::filesystem::path& kernels, bool profile) {
+    // initialization of device components (CommandQueue, Allocator, Counters, ...)
     auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
     value = MTL::CreateSystemDefaultDevice();
     if (!value) throw std::runtime_error("Metal device unavailable");
     if (!value->supportsPlacementSparse()) throw std::runtime_error("placement sparse buffers unsupported");
-    queue = value->newMTL4CommandQueue(); allocator = value->newCommandAllocator(); commandBuffer = value->newCommandBuffer();
-    if (!queue || !allocator || !commandBuffer) throw std::runtime_error("MTL4 command resources unavailable");
-    auto descriptor = NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init()); descriptor->setInitialCapacity(512);
-    NS::Error* error = nullptr; residency = value->newResidencySet(descriptor.get(), &error);
+    queue = value->newMTL4CommandQueue();
+    allocator = value->newCommandAllocator();
+    if (!queue || !allocator) throw std::runtime_error("MTL4 command resources unavailable");
+    auto descriptor = NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init());
+    descriptor->setInitialCapacity(512);
+    NS::Error* error = nullptr;
+    residency = value->newResidencySet(descriptor.get(), &error);
     if (!residency) throw std::runtime_error(message(error));
     event = value->newSharedEvent();
     if (!event) throw std::runtime_error("shared event creation failed");
@@ -29,27 +33,31 @@ Device::Device(const std::filesystem::path& kernels, bool profile) {
         counterHeap = value->newCounterHeap(counters.get(), &error);
         if (!counterHeap) throw std::runtime_error(message(error));
     }
+    // find and compile shaders into MTL-Library
     std::vector<std::filesystem::path> sources;
     for (const auto& entry : std::filesystem::directory_iterator(kernels))
         if (entry.path().extension() == ".metal") sources.push_back(entry.path());
     std::sort(sources.begin(), sources.end());
     for (const auto& path : sources) {
-        std::ifstream file(path); std::stringstream stream; stream << file.rdbuf();
+        std::ifstream file(path);
+        std::stringstream stream;
+        stream << file.rdbuf();
         auto source = NS::String::string(stream.str().c_str(), NS::UTF8StringEncoding);
         MTL::Library* library = value->newLibrary(source, nullptr, &error);
         if (!library) throw std::runtime_error(path.filename().string() + ": " + message(error));
         libraries.push_back(library);
     }
-    constants = empty(1 << 20, true); tables.reserve(512);
 }
 Device::~Device() {
-    constants = {}; for (auto* table : tables) table->release();
     for (auto& [_, pipeline] : pipelines) pipeline->release();
     for (auto* library : libraries) library->release();
     if (counterHeap) counterHeap->release();
     if (event) event->release();
-    if (residency) { queue->removeResidencySet(residency); residency->release(); }
-    if (commandBuffer) commandBuffer->release(); if (allocator) allocator->release(); if (queue) queue->release();
+    if (residency) {
+        queue->removeResidencySet(residency); residency->release();
+    }
+    if (allocator) allocator->release();
+    if (queue) queue->release();
     if (value) value->release();
 }
 void Device::add(MTL::Allocation* allocation) { residency->addAllocation(allocation); residency->commit(); }
@@ -64,14 +72,16 @@ Tensor Device::upload(const void* source, uint64_t bytes) { Tensor target = empt
 void Device::write(const Tensor& destination, const void* source, uint64_t bytes) {
     if (bytes > destination.bytes) throw std::runtime_error("buffer write exceeds destination");
     if (destination.buffer->value->storageMode() == MTL::StorageModeShared) {
-        std::memcpy(static_cast<uint8_t*>(destination.buffer->value->contents()) + destination.offset, source, bytes); return;
+        std::memcpy(static_cast<uint8_t*>(destination.buffer->value->contents()) + destination.offset, source, bytes);
+        return;
     }
     MTL::Buffer* staging = value->newBuffer(source, bytes, MTL::ResourceStorageModeShared);
-    if (!staging) throw std::runtime_error("staging allocation failed"); add(staging);
-    commandBuffer->beginCommandBuffer(allocator); commandBuffer->useResidencySet(residency);
-    auto* encoder = commandBuffer->computeCommandEncoder();
-    encoder->copyFromBuffer(staging, 0, destination.buffer->value, destination.offset, bytes);
-    encoder->endEncoding(); finish(false); remove(staging); staging->release();
+    if (!staging) throw std::runtime_error("staging allocation failed");
+    add(staging);
+    CommandBuffer commands(*this, 0, false);
+    commands.copy(staging, 0, destination.buffer->value, destination.offset, bytes);
+    commands.commit();
+    remove(staging); staging->release();
 }
 Pipeline* Device::pipeline(const std::string& name) {
     if (auto found = pipelines.find(name); found != pipelines.end()) return found->second;
@@ -83,43 +93,61 @@ Pipeline* Device::pipeline(const std::string& name) {
     if (!result) throw std::runtime_error(name + ": " + message(error));
     pipelines.emplace(name, result); return result;
 }
-void Device::preparePass(uint64_t constantBytes, uint32_t tableCount) {
-    if (constantBytes > constants.bytes) constants = empty(std::max(constantBytes, constants.bytes * 2), true);
-    while (tables.size() < tableCount) table(tables.size());
+CommandBuffer::CommandBuffer(Device& device, uint64_t constantBytes, bool profilePass)
+    : device(device), constants(constantBytes ? device.empty(constantBytes, true) : Tensor{}), profilePass(profilePass) {
+    value = device.value->newCommandBuffer();
+    if (!value) throw std::runtime_error("MTL4 command buffer creation failed");
+    value->beginCommandBuffer(device.allocator);
+    value->useResidencySet(device.residency);
+
+    if (profilePass && device.counterHeap) {
+        device.counterHeap->invalidateCounterRange(NS::Range::Make(0, 2));
+        value->writeTimestampIntoHeap(device.counterHeap, 0);
+    }
+    encoder = value->computeCommandEncoder();
+    encoder->barrierAfterQueueStages(MTL::StageResourceState, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
 }
-MTL4::ArgumentTable* Device::table(uint32_t index) {
+MTL4::ArgumentTable* CommandBuffer::table(uint32_t index) {
     if (index < tables.size()) return tables[index];
     auto descriptor = NS::TransferPtr(MTL4::ArgumentTableDescriptor::alloc()->init());
     descriptor->setMaxBufferBindCount(16); descriptor->setInitializeBindings(true);
-    NS::Error* error = nullptr; auto* result = value->newArgumentTable(descriptor.get(), &error);
-    if (!result) throw std::runtime_error(message(error)); tables.push_back(result); return result;
+    NS::Error* error = nullptr;
+    auto* result = device.value->newArgumentTable(descriptor.get(), &error);
+    if (!result) throw std::runtime_error(message(error));
+    tables.push_back(result); return result;
 }
-void Device::finish(bool profilePass) {
-    if (profilePass && counterHeap) commandBuffer->writeTimestampIntoHeap(counterHeap, 1);
-    commandBuffer->endCommandBuffer(); const MTL4::CommandBuffer* commands[] = {commandBuffer}; queue->commit(commands, 1);
-    uint64_t signal = ++eventValue; queue->signalEvent(event, signal);
-    if (!event->waitUntilSignaledValue(signal, std::numeric_limits<uint64_t>::max()))
+void CommandBuffer::copy(MTL::Buffer* source, uint64_t sourceOffset, MTL::Buffer* destination,
+                         uint64_t destinationOffset, uint64_t bytes) {
+    encoder->copyFromBuffer(source, sourceOffset, destination, destinationOffset, bytes);
+}
+void CommandBuffer::submit(bool profilePass) {
+    if (profilePass && device.counterHeap) value->writeTimestampIntoHeap(device.counterHeap, 1);
+    value->endCommandBuffer();
+    const MTL4::CommandBuffer* commands[] = {value};
+    device.queue->commit(commands, 1);
+    uint64_t signal = ++device.eventValue;
+    device.queue->signalEvent(device.event, signal);
+    if (!device.event->waitUntilSignaledValue(signal, std::numeric_limits<uint64_t>::max()))
         throw std::runtime_error("Metal event wait timed out");
-    if (profilePass && counterHeap) {
-        NS::Data* data = counterHeap->resolveCounterRange(NS::Range::Make(0, 2));
+    if (profilePass && device.counterHeap) {
+        NS::Data* data = device.counterHeap->resolveCounterRange(NS::Range::Make(0, 2));
         auto* timestamps = static_cast<const MTL4::TimestampHeapEntry*>(data->bytes());
-        stats.gpuTimeNs += timestamps[1].timestamp - timestamps[0].timestamp; ++stats.passes;
+        device.stats.gpuTimeNs += timestamps[1].timestamp - timestamps[0].timestamp;
+        ++device.stats.passes;
     }
-    allocator->reset();
+    device.allocator->reset();
 }
-Pass::Pass(Device& device) : device(device) {
-    device.commandBuffer->beginCommandBuffer(device.allocator); device.commandBuffer->useResidencySet(device.residency);
-    if (device.counterHeap) {
-        device.counterHeap->invalidateCounterRange(NS::Range::Make(0, 2));
-        device.commandBuffer->writeTimestampIntoHeap(device.counterHeap, 0);
-    }
-    encoder = device.commandBuffer->computeCommandEncoder();
-    encoder->barrierAfterQueueStages(MTL::StageResourceState, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
+CommandBuffer::~CommandBuffer() {
+    if (encoder) try {
+        encoder->endEncoding(); encoder = nullptr; submit(false);
+    } catch (...) {}
+    for (auto* argumentTable : tables) argumentTable->release();
+    if (value) value->release();
 }
-Pass::~Pass() {
-    if (encoder) try { encoder->endEncoding(); device.finish(false); } catch (...) {}
+void CommandBuffer::commit() {
+    encoder->endEncoding(); encoder = nullptr; submit(profilePass);
 }
-void Pass::commit() { encoder->endEncoding(); encoder = nullptr; device.finish(true); }
+
 SparseBuffers::SparseBuffers(Device& device, uint32_t maxContext)
     : device(device), maxPages(uint32_t((uint64_t(maxContext) + pageTokens - 1) / pageTokens)) {
     uint64_t bytes = uint64_t(maxContext) * 4 * 256 * 2; buffers.reserve(count);

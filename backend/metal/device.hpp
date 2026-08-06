@@ -30,16 +30,25 @@ struct Tensor {
     MTL::GPUAddress address() const { return buffer->value->gpuAddress() + offset; }
 };
 using Pipeline = MTL::ComputePipelineState;
-class Pass {
+class CommandBuffer {
+    friend class Device;
     Device& device;
-    MTL4::ComputeCommandEncoder* encoder;
+    MTL4::CommandBuffer* value = nullptr;
+    MTL4::ComputeCommandEncoder* encoder = nullptr;
+    Tensor constants;
+    std::vector<MTL4::ArgumentTable*> tables;
+    bool profilePass;
     uint64_t constantOffset = 0;
     uint32_t tableIndex = 0;
     template <class T> void scalar(MTL4::ArgumentTable* table, uint32_t index, const T& value);
+    MTL4::ArgumentTable* table(uint32_t index);
+    void copy(MTL::Buffer* source, uint64_t sourceOffset, MTL::Buffer* destination, uint64_t destinationOffset,
+              uint64_t bytes);
+    void submit(bool profilePass);
 public:
-    explicit Pass(Device& device);
-    Pass(const Pass&) = delete;
-    ~Pass();
+    explicit CommandBuffer(Device& device, uint64_t constantBytes = 1 << 20, bool profilePass = true);
+    CommandBuffer(const CommandBuffer&) = delete;
+    ~CommandBuffer();
     template <class... Scalars>
     void dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group, std::initializer_list<Tensor> tensors,
                   const Scalars&... scalars);
@@ -47,24 +56,19 @@ public:
 };
 class Device {
     friend struct Buffer;
-    friend class Pass;
+    friend class CommandBuffer;
     friend class SparseBuffers;
     MTL::Device* value = nullptr;
     MTL4::CommandQueue* queue = nullptr;
     MTL4::CommandAllocator* allocator = nullptr;
-    MTL4::CommandBuffer* commandBuffer = nullptr;
     MTL::ResidencySet* residency = nullptr;
     MTL::SharedEvent* event = nullptr;
     MTL4::CounterHeap* counterHeap = nullptr;
     std::vector<MTL::Library*> libraries;
     std::unordered_map<std::string, Pipeline*> pipelines;
-    std::vector<MTL4::ArgumentTable*> tables;
-    Tensor constants;
     uint64_t eventValue = 0;
     void add(MTL::Allocation* allocation);
     void remove(MTL::Allocation* allocation);
-    MTL4::ArgumentTable* table(uint32_t index);
-    void finish(bool profilePass);
 public:
     Device(const std::filesystem::path& kernels, bool profile);
     Device(const Device&) = delete;
@@ -73,7 +77,6 @@ public:
     Tensor upload(const void* source, uint64_t bytes);
     void write(const Tensor& destination, const void* source, uint64_t bytes);
     Pipeline* pipeline(const std::string& name);
-    void preparePass(uint64_t constantBytes, uint32_t tableCount);
     const Counters& counters() const { return stats; }
     Counters stats;
 };
@@ -95,20 +98,21 @@ public:
     Tensor value(uint32_t attentionLayer) const { return buffers[2 * attentionLayer + 1]; }
     uint64_t mappedBytes() const { return uint64_t(mappedPages) * count * pageBytes; }
 };
-template <class T> void Pass::scalar(MTL4::ArgumentTable* table, uint32_t index, const T& value) {
+template <class T> void CommandBuffer::scalar(MTL4::ArgumentTable* table, uint32_t index, const T& value) {
     static_assert(std::is_trivially_copyable_v<T>);
     constantOffset = (constantOffset + 15) & ~15ull;
-    if (constantOffset + sizeof(T) > device.constants.bytes) throw std::runtime_error("pass constant storage exceeded");
-    std::memcpy(static_cast<uint8_t*>(device.constants.buffer->value->contents()) + constantOffset, &value, sizeof(T));
-    table->setAddress(device.constants.address() + constantOffset, index); constantOffset += sizeof(T);
+    if (constantOffset + sizeof(T) > constants.bytes)
+        throw std::runtime_error("command buffer constant storage exceeded");
+    std::memcpy(static_cast<uint8_t*>(constants.buffer->value->contents()) + constantOffset, &value, sizeof(T));
+    table->setAddress(constants.address() + constantOffset, index); constantOffset += sizeof(T);
 }
 template <class... Scalars>
-void Pass::dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group, std::initializer_list<Tensor> tensors,
-                    const Scalars&... scalars) {
-    auto* table = device.table(tableIndex++); uint32_t index = 0;
-    for (const Tensor& tensor : tensors) table->setAddress(tensor.address(), index++);
-    (scalar(table, index++, scalars), ...);
-    encoder->setComputePipelineState(pipeline); encoder->setArgumentTable(table); encoder->dispatchThreads(threads, group);
+void CommandBuffer::dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group,
+                             std::initializer_list<Tensor> tensors, const Scalars&... scalars) {
+    auto* argumentTable = table(tableIndex++); uint32_t index = 0;
+    for (const Tensor& tensor : tensors) argumentTable->setAddress(tensor.address(), index++);
+    (scalar(argumentTable, index++, scalars), ...);
+    encoder->setComputePipelineState(pipeline); encoder->setArgumentTable(argumentTable); encoder->dispatchThreads(threads, group);
     encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
     ++device.stats.dispatches;
 }

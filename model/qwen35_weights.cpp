@@ -243,10 +243,10 @@ Model::Model(const std::filesystem::path& path, const std::filesystem::path& ker
                device.pipeline("attention_gate"), device.pipeline("unpack_attention"), device.pipeline("rope_qk"),
                device.pipeline("gdn_prepare"), device.pipeline("gdn_causal_conv_silu"), device.pipeline("split_repeat_qk"),
                device.pipeline("delta_rule_prefill"), device.pipeline("delta_rule_decode"), device.pipeline("rmsnorm_gated_128")};
-    rope = device.empty(uint64_t(context) * 32 * 2 * 2); device.preparePass(64, 1);
-    { Pass pass(device); pass.dispatch(kernels.initRope, MTL::Size(((uint64_t(context) * 32 + 255) / 256) * 256, 1, 1),
-                                      MTL::Size(256, 1, 1), {rope}, context, 10000000.0f); pass.commit(); }
-    decode.ensure(device, 1); device.preparePass(1 << 20, 512);
+    rope = device.empty(uint64_t(context) * 32 * 2 * 2);
+    { CommandBuffer commands(device, 64); commands.dispatch(kernels.initRope, MTL::Size(((uint64_t(context) * 32 + 255) / 256) * 256, 1, 1),
+                                      MTL::Size(256, 1, 1), {rope}, context, 10000000.0f); commands.commit(); }
+    decode.ensure(device, 1);
     std::printf("GGUF weights loaded in %.3fs\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
 }
 }  // namespace infeng::qwen35
