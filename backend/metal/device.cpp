@@ -172,7 +172,7 @@ void SparseBuffers::addHeap() {
     mappedPages += pages;
 }
 void SparseBuffers::ensure(uint32_t tokens) {
-    uint32_t target = std::min(maxPages, uint32_t((uint64_t(tokens) + pageTokens - 1) / pageTokens));
+    uint32_t target = (uint64_t(tokens) + pageTokens - 1) / pageTokens;
     while (mappedPages < target) addHeap();
 }
 SparseBuffers::~SparseBuffers() {
