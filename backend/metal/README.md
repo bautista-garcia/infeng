@@ -24,4 +24,4 @@ Pass `profile=True` to `NativeModel` or run the standalone profiler to collect p
 python benchmarks/profile_qwen35.py --prefill 128 --decode 32
 ```
 
-The report aggregates by phase (`prefill` or `decode`) and pipeline name, including launch count, average GPU time per forward, and time share.
+The report aggregates by phase (`prefill` or `decode`) and pipeline name, including launch count, average GPU time per forward, and time share. Profiling supports the short benchmark prefills used by this project; longer prefills can exceed AGX’s 4096-entry timestamp limit.

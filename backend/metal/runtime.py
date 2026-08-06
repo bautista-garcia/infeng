@@ -86,6 +86,7 @@ class NativeSession:
 class NativeModel:
     def __init__(self, weights: str | Path, *, max_context=65536, profile=False):
         self._session = None
+        self.handle = 0
         self.handle = _check(_LIB.infeng_model_create(str(weights).encode(), str(KERNELS).encode(), max_context, profile))
 
     def session(self):
@@ -117,6 +118,6 @@ class NativeModel:
     def close(self):
         live = self._session() if self._session else None
         if live is not None: live.close()
-        if self.handle: _LIB.infeng_model_release(self.handle); self.handle = 0
+        if getattr(self, "handle", 0): _LIB.infeng_model_release(self.handle); self.handle = 0
 
     def __del__(self): self.close()

@@ -55,6 +55,7 @@ class CommandBuffer {
     MTL4::ArgumentTable* table(uint32_t index);
     void copy(MTL::Buffer* source, uint64_t sourceOffset, MTL::Buffer* destination, uint64_t destinationOffset,
               uint64_t bytes);
+    void writeTimestamp(uint32_t index);
     void submit();
 public:
     explicit CommandBuffer(Device& device, uint64_t constantBytes = 1 << 20, bool profile = true,
@@ -70,6 +71,7 @@ class Device {
     friend struct Buffer;
     friend class CommandBuffer;
     friend class SparseBuffers;
+    static constexpr uint32_t counterHeapEntries = 4096;
     MTL::Device* metalDevice = nullptr;
     MTL4::CommandQueue* queue = nullptr;
     MTL4::CommandAllocator* allocator = nullptr;
@@ -81,6 +83,7 @@ class Device {
     std::unordered_map<Pipeline*, std::string> pipelineNames;
     std::vector<KernelCounter> kernelStats;
     uint64_t eventValue = 0;
+    bool profileEnabled = false;
     void add(MTL::Allocation* allocation);
     void remove(MTL::Allocation* allocation);
     void recordKernel(const std::string& phase, const std::string& name, uint64_t gpuTimeNs);
@@ -130,7 +133,7 @@ void CommandBuffer::dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size gr
     uint32_t start = 0, end = 0;
     if (counterHeap) {
         if (counterIndex + 2 > counterLimit) throw std::runtime_error("command buffer counter storage exceeded");
-        start = counterIndex++; encoder->writeTimestamp(MTL4::TimestampGranularityPrecise, counterHeap, start);
+        start = counterIndex++; writeTimestamp(start);
     }
     auto* argumentTable = table(tableIndex++); uint32_t index = 0;
     for (const Tensor& tensor : tensors) argumentTable->setAddress(tensor.address(), index++);
@@ -139,7 +142,7 @@ void CommandBuffer::dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size gr
     encoder->dispatchThreads(threads, group);
     encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
     if (counterHeap) {
-        end = counterIndex++; encoder->writeTimestamp(MTL4::TimestampGranularityPrecise, counterHeap, end);
+        end = counterIndex++; writeTimestamp(end);
         profiles.push_back({device.pipelineName(pipeline), start, end});
     }
     ++device.stats.dispatches;

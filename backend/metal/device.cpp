@@ -11,7 +11,7 @@ static std::string message(NS::Error* error) {
     return description ? description->utf8String() : "Metal operation failed";
 }
 Buffer::~Buffer() { device->remove(metalBuffer); metalBuffer->release(); }
-Device::Device(const std::filesystem::path& kernels, bool profile) {
+Device::Device(const std::filesystem::path& kernels, bool profile) : profileEnabled(profile) {
     auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
     metalDevice = MTL::CreateSystemDefaultDevice();
     if (!metalDevice) throw std::runtime_error("Metal device unavailable");
@@ -28,10 +28,9 @@ Device::Device(const std::filesystem::path& kernels, bool profile) {
     event = metalDevice->newSharedEvent();
     if (!event) throw std::runtime_error("shared event creation failed");
     queue->addResidencySet(residency);
-    // allocate optional GPU timestamps for whole-command-buffer timing
     if (profile) {
         auto counters = NS::TransferPtr(MTL4::CounterHeapDescriptor::alloc()->init());
-        counters->setType(MTL4::CounterHeapTypeTimestamp); counters->setCount(1 << 18);
+        counters->setType(MTL4::CounterHeapTypeTimestamp); counters->setCount(counterHeapEntries);
         counterHeap = metalDevice->newCounterHeap(counters.get(), &error);
         if (!counterHeap) throw std::runtime_error(message(error));
     }
@@ -111,7 +110,7 @@ Pipeline* Device::pipeline(const std::string& name) {
 CommandBuffer::CommandBuffer(Device& device, uint64_t constantBytes, bool profile, uint32_t dispatchCapacity,
                              const char* passPhase)
     : device(device), constants(constantBytes ? device.empty(constantBytes, true) : Tensor{}),
-      phase(passPhase), profiling(profile && device.counterHeap) {
+      phase(passPhase), profiling(profile && device.profileEnabled) {
     metalCommandBuffer = device.metalDevice->newCommandBuffer();
     if (!metalCommandBuffer) throw std::runtime_error("MTL4 command buffer creation failed");
     // begin recording, attach resource residency, and open the compute encoder
@@ -122,8 +121,9 @@ CommandBuffer::CommandBuffer(Device& device, uint64_t constantBytes, bool profil
     if (profiling) {
         counterHeap = device.counterHeap; counterLimit = 2 + 2 * dispatchCapacity;
         if (counterLimit > counterHeap->count())
-            throw std::runtime_error("command buffer counter heap capacity exceeded");
-        counterHeap->invalidateCounterRange(NS::Range::Make(0, counterLimit)); counterIndex = 2;
+            throw std::runtime_error("profiling forward exceeds the 4096-timestamp counter heap; use a shorter prefill");
+        counterHeap->invalidateCounterRange(NS::Range::Make(0, counterLimit));
+        counterIndex = 2;
         metalCommandBuffer->writeTimestampIntoHeap(counterHeap, 0);
     }
     encoder = metalCommandBuffer->computeCommandEncoder();
@@ -141,6 +141,9 @@ MTL4::ArgumentTable* CommandBuffer::table(uint32_t index) {
 void CommandBuffer::copy(MTL::Buffer* source, uint64_t sourceOffset, MTL::Buffer* destination,
                          uint64_t destinationOffset, uint64_t bytes) {
     encoder->copyFromBuffer(source, sourceOffset, destination, destinationOffset, bytes);
+}
+void CommandBuffer::writeTimestamp(uint32_t index) {
+    encoder->writeTimestamp(MTL4::TimestampGranularityPrecise, counterHeap, index);
 }
 void CommandBuffer::submit() {
     // end, submit, wait for completion, resolve timestamps, and recycle command memory
