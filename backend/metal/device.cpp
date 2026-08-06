@@ -138,9 +138,6 @@ void CommandBuffer::submit(bool profilePass) {
     device.allocator->reset();
 }
 CommandBuffer::~CommandBuffer() {
-    if (encoder) try {
-        encoder->endEncoding(); encoder = nullptr; submit(false);
-    } catch (...) {}
     for (auto* argumentTable : tables) argumentTable->release();
     if (value) value->release();
 }
