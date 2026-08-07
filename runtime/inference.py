@@ -47,11 +47,11 @@ class Session:
 
 
 class InferenceEngine:
-    def __init__(self, weights: str | Path, tokenizer: str, *, max_context: int = 65536, profile: bool = False):
+    def __init__(self, weights: str | Path, tokenizer: str, *, max_context: int = 65536):
         if not 0 < max_context <= 65536: raise ValueError(f"max_context must be between 1 and 65536, got {max_context}")
         self._session = None
-        self.max_context, self.profile, self.device, self.dtype = max_context, profile, "metal4", "float16"
-        self.native = NativeModel(weights, max_context=max_context, profile=profile)
+        self.max_context, self.device, self.dtype = max_context, "metal4", "float16"
+        self.native = NativeModel(weights, max_context=max_context)
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
 
     def session(self):
@@ -66,12 +66,5 @@ class InferenceEngine:
         live = self._session() if self._session else None
         if live is not None: live.close()
         if self.native: self.native.close(); self.native = None
-
-    def profile_counters(self):
-        if not self.profile: return {}
-        counters = self.native.counters(); live = self._session() if self._session else None
-        counters["kernel_counters"] = self.native.kernel_counters()
-        if live is not None and not live.closed: counters["mapped_kv_bytes"] = live.mapped_kv_bytes
-        return counters
 
     def __del__(self): self.close()

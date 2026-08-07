@@ -146,7 +146,7 @@ MlpWeights makeMlp(Device& device, std::unordered_map<std::string, Weight>& weig
 }
 }  // namespace
 Model::Model(const std::filesystem::path& path, const std::filesystem::path& kernelPath,
-             uint32_t context, bool profile) : device(kernelPath, profile), maxContext(context) {
+             uint32_t context) : device(kernelPath), maxContext(context) {
     auto started = std::chrono::steady_clock::now();
     if (path.extension() != ".gguf") throw std::runtime_error("Qwen3.5 only accepts GGUF weights");
     if (!context || context > 65536) throw std::runtime_error("max_context must be between 1 and 65536");

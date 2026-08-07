@@ -62,7 +62,7 @@ struct Model {
     Scratch decode, prefill;
     uint64_t parameterCount = 0, modelBytes = 0;
     bool sessionLive = false;
-    Model(const std::filesystem::path& weights, const std::filesystem::path& kernels, uint32_t maxContext, bool profile);
+    Model(const std::filesystem::path& weights, const std::filesystem::path& kernels, uint32_t maxContext);
     Scratch& scratch(uint32_t seq) { Scratch& value = seq == 1 ? decode : prefill; value.ensure(device, seq); return value; }
 };
 struct LayerState {
@@ -83,13 +83,9 @@ int32_t forward(Model& model, Session& session, const int32_t* ids, uint32_t seq
                 float temperature, float topP, int32_t topK);
 }  // namespace infeng::qwen35
 extern "C" {
-struct InfengCounters {
-    uint64_t gpu_time_ns, passes, dispatches, allocations, allocated_bytes;
-};
 #define INFENG_EXPORT __attribute__((visibility("default")))
 INFENG_EXPORT const char* infeng_last_error();
-INFENG_EXPORT void* infeng_model_create(const char* weights_path, const char* kernels_path, uint32_t max_context,
-                                        int32_t profile);
+INFENG_EXPORT void* infeng_model_create(const char* weights_path, const char* kernels_path, uint32_t max_context);
 INFENG_EXPORT void infeng_model_release(void* model);
 INFENG_EXPORT void* infeng_session_create(void* model);
 INFENG_EXPORT void infeng_session_release(void* session);
@@ -100,8 +96,4 @@ INFENG_EXPORT uint64_t infeng_session_mapped_bytes(void* session);
 INFENG_EXPORT uint64_t infeng_model_parameter_count(void* model);
 INFENG_EXPORT uint64_t infeng_model_weight_bytes(void* model);
 INFENG_EXPORT uint64_t infeng_model_vocab_size(void* model);
-INFENG_EXPORT int32_t infeng_model_counters(void* model, InfengCounters* output);
-INFENG_EXPORT uint32_t infeng_model_kernel_counter_count(void* model);
-INFENG_EXPORT int32_t infeng_model_kernel_counter(void* model, uint32_t index, const char** phase, const char** name,
-                                                  uint64_t* gpu_time_ns, uint64_t* launches);
 }
