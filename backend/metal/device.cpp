@@ -11,7 +11,7 @@ static std::string message(NS::Error* error) {
     return description ? description->utf8String() : "Metal operation failed";
 }
 Buffer::~Buffer() { device->remove(metalBuffer); metalBuffer->release(); }
-Device::Device(const std::filesystem::path& kernels) {
+Device::Device(const std::filesystem::path& kernels, bool profile) {
     auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
     metalDevice = MTL::CreateSystemDefaultDevice();
     if (!metalDevice) throw std::runtime_error("Metal device unavailable");
@@ -28,6 +28,13 @@ Device::Device(const std::filesystem::path& kernels) {
     event = metalDevice->newSharedEvent();
     if (!event) throw std::runtime_error("shared event creation failed");
     queue->addResidencySet(residency);
+    if (profile) {
+        auto counters = NS::TransferPtr(MTL4::CounterHeapDescriptor::alloc()->init());
+        counters->setType(MTL4::CounterHeapTypeTimestamp); counters->setCount(counterHeapEntries);
+        counterHeap = metalDevice->newCounterHeap(counters.get(), &error);
+        if (!counterHeap) throw std::runtime_error(message(error));
+        timestampFrequency = metalDevice->queryTimestampFrequency();
+    }
     // find and compile all Metal sources into libraries
     std::vector<std::filesystem::path> sources;
     for (const auto& entry : std::filesystem::directory_iterator(kernels))
@@ -46,12 +53,20 @@ Device::Device(const std::filesystem::path& kernels) {
 Device::~Device() {
     for (auto& [_, pipeline] : pipelines) pipeline->release();
     for (auto* library : libraries) library->release();
+    if (counterHeap) counterHeap->release();
     event->release();
     queue->removeResidencySet(residency); residency->release();
     allocator->release(); queue->release(); metalDevice->release();
 }
 void Device::add(MTL::Allocation* allocation) { residency->addAllocation(allocation); residency->commit(); }
 void Device::remove(MTL::Allocation* allocation) { residency->removeAllocation(allocation); residency->commit(); }
+void Device::recordKernel(const std::string& phase, const std::string& name, uint64_t gpuTimeNs) {
+    auto found = std::find_if(kernelStats.begin(), kernelStats.end(), [&](const KernelCounter& counter) {
+        return counter.phase == phase && counter.name == name;
+    });
+    if (found == kernelStats.end()) kernelStats.push_back({phase, name, gpuTimeNs, 1});
+    else found->gpuTimeNs += gpuTimeNs, ++found->launches;
+}
 Tensor Device::empty(uint64_t bytes, bool shared) {
     MTL::Buffer* buffer = metalDevice->newBuffer(
         bytes, shared ? MTL::ResourceStorageModeShared : MTL::ResourceStorageModePrivate);
@@ -90,16 +105,26 @@ Pipeline* Device::pipeline(const std::string& name) {
     function->release();
     if (!pipelineState) throw std::runtime_error(name + ": " + message(error));
     pipelines.emplace(name, pipelineState);
+    pipelineNames.emplace(pipelineState, name);
     return pipelineState;
 }
-CommandBuffer::CommandBuffer(Device& device, uint64_t constantBytes)
-    : device(device), constants(constantBytes ? device.empty(constantBytes, true) : Tensor{}) {
+CommandBuffer::CommandBuffer(Device& device, uint64_t constantBytes, bool profile, uint32_t dispatchCapacity,
+                             const char* passPhase)
+    : device(device), constants(constantBytes ? device.empty(constantBytes, true) : Tensor{}),
+      phase(passPhase), profiling(profile && device.counterHeap) {
     metalCommandBuffer = device.metalDevice->newCommandBuffer();
     if (!metalCommandBuffer) throw std::runtime_error("MTL4 command buffer creation failed");
     // begin recording, attach resource residency, and open the compute encoder
     metalCommandBuffer->beginCommandBuffer(device.allocator);
     metalCommandBuffer->useResidencySet(device.residency);
 
+    if (profiling) {
+        counterHeap = device.counterHeap; counterLimit = 2 + 2 * dispatchCapacity;
+        if (counterLimit > counterHeap->count())
+            throw std::runtime_error("profiling forward exceeds the 4096-timestamp counter heap; use a shorter prefill");
+        counterHeap->invalidateCounterRange(NS::Range::Make(0, counterLimit)); counterIndex = 2;
+        metalCommandBuffer->writeTimestampIntoHeap(counterHeap, 0);
+    }
     encoder = metalCommandBuffer->computeCommandEncoder();
     encoder->barrierAfterQueueStages(MTL::StageResourceState, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
 }
@@ -117,7 +142,8 @@ void CommandBuffer::copy(MTL::Buffer* source, uint64_t sourceOffset, MTL::Buffer
     encoder->copyFromBuffer(source, sourceOffset, destination, destinationOffset, bytes);
 }
 void CommandBuffer::submit() {
-    // end, submit, wait for completion, and recycle command memory
+    // end, submit, wait for completion, resolve timestamps, and recycle command memory
+    if (profiling) metalCommandBuffer->writeTimestampIntoHeap(counterHeap, 1);
     metalCommandBuffer->endCommandBuffer();
     const MTL4::CommandBuffer* commands[] = {metalCommandBuffer};
     device.queue->commit(commands, 1);
@@ -125,6 +151,15 @@ void CommandBuffer::submit() {
     device.queue->signalEvent(device.event, signal);
     if (!device.event->waitUntilSignaledValue(signal, std::numeric_limits<uint64_t>::max()))
         throw std::runtime_error("Metal event wait timed out");
+    if (profiling) {
+        NS::Data* data = counterHeap->resolveCounterRange(NS::Range::Make(0, counterIndex));
+        auto* timestamps = static_cast<const MTL4::TimestampHeapEntry*>(data->bytes());
+        device.stats.gpuTimeNs += device.timestampNanoseconds(timestamps[1].timestamp - timestamps[0].timestamp);
+        ++device.stats.passes;
+        for (const auto& profile : profiles)
+            device.recordKernel(phase, profile.name, device.timestampNanoseconds(
+                timestamps[profile.end].timestamp - timestamps[profile.start].timestamp));
+    }
     device.allocator->reset();
 }
 CommandBuffer::~CommandBuffer() {

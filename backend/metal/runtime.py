@@ -23,10 +23,14 @@ def _build():
                     "-framework", "Foundation", "-framework", "Metal", "-o", str(LIB)], check=True)
 
 
+class _Counters(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in ("gpu_time_ns", "passes")]
+
+
 def _load():
     _build(); lib = ctypes.CDLL(LIB)
     lib.infeng_last_error.restype = ctypes.c_char_p
-    lib.infeng_model_create.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32)
+    lib.infeng_model_create.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_int32)
     lib.infeng_model_create.restype = ctypes.c_void_p
     lib.infeng_model_release.argtypes = (ctypes.c_void_p,)
     lib.infeng_session_create.argtypes = (ctypes.c_void_p,); lib.infeng_session_create.restype = ctypes.c_void_p
@@ -37,6 +41,11 @@ def _load():
     lib.infeng_session_mapped_bytes.argtypes = (ctypes.c_void_p,); lib.infeng_session_mapped_bytes.restype = ctypes.c_uint64
     for name in ("infeng_model_parameter_count", "infeng_model_weight_bytes", "infeng_model_vocab_size"):
         function = getattr(lib, name); function.argtypes = (ctypes.c_void_p,); function.restype = ctypes.c_uint64
+    lib.infeng_model_counters.argtypes = (ctypes.c_void_p, ctypes.POINTER(_Counters))
+    lib.infeng_model_kernel_counter_count.argtypes = (ctypes.c_void_p,); lib.infeng_model_kernel_counter_count.restype = ctypes.c_uint32
+    lib.infeng_model_kernel_counter.argtypes = (ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_char_p),
+                                                ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_uint64),
+                                                ctypes.POINTER(ctypes.c_uint64))
     return lib
 
 
@@ -74,10 +83,10 @@ class NativeSession:
 
 
 class NativeModel:
-    def __init__(self, weights: str | Path, *, max_context=65536):
+    def __init__(self, weights: str | Path, *, max_context=65536, profile=False):
         self._session = None
         self.handle = 0
-        self.handle = _check(_LIB.infeng_model_create(str(weights).encode(), str(KERNELS).encode(), max_context))
+        self.handle = _check(_LIB.infeng_model_create(str(weights).encode(), str(KERNELS).encode(), max_context, profile))
 
     def session(self):
         session = NativeSession(self); self._session = weakref.ref(session); return session
@@ -90,6 +99,20 @@ class NativeModel:
 
     @property
     def vocab_size(self): return _LIB.infeng_model_vocab_size(self.handle)
+
+    def counters(self):
+        output = _Counters(); _status(_LIB.infeng_model_counters(self.handle, ctypes.byref(output)))
+        return {name: getattr(output, name) for name, _ in output._fields_}
+
+    def kernel_counters(self):
+        counters = []
+        for index in range(_LIB.infeng_model_kernel_counter_count(self.handle)):
+            phase = ctypes.c_char_p(); name = ctypes.c_char_p(); gpu_time_ns = ctypes.c_uint64(); launches = ctypes.c_uint64()
+            _status(_LIB.infeng_model_kernel_counter(self.handle, index, ctypes.byref(phase), ctypes.byref(name),
+                                                     ctypes.byref(gpu_time_ns), ctypes.byref(launches)))
+            counters.append({"phase": phase.value.decode(), "name": name.value.decode(),
+                             "gpu_time_ns": gpu_time_ns.value, "launches": launches.value})
+        return counters
 
     def close(self):
         live = self._session() if self._session else None

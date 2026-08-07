@@ -15,3 +15,13 @@ A complete 64 MiB heap therefore provides space for:
 ```
 
 When the model needs more KV-cache capacity, `ensure()` maps additional sparse-buffer pages to heap tiles. If the current heap has no remaining tiles, another 64 MiB heap is created and added to the residency set. The sparse buffers do not automatically request memory; the application explicitly grows them before dispatching kernels.
+
+## Kernel profiling
+
+Run the profiler to rank kernels inside the complete forward command buffer:
+
+```bash
+python benchmarks/profile_qwen35.py --prefill 128 --decode 32
+```
+
+Metal timestamps are GPU clock ticks, converted with the device timestamp frequency before reporting milliseconds. Precise timestamp markers add a small measurement overhead, so use the normal wall-clock benchmark for final latency numbers.
