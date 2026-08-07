@@ -38,19 +38,24 @@ def merge(target, samples):
         current["gpu_time_ns"] += sample["gpu_time_ns"]; current["launches"] += sample["launches"]
 
 
-def report(label, totals, gpu_time_ns, forwards):
+def report(label, totals, gpu_time_ns, forwards, tokens_per_forward):
     rows = sorted(totals.values(), key=lambda sample: sample["gpu_time_ns"], reverse=True)
     whole_ms = gpu_time_ns / forwards / 1e6
+    baseline_tps = tokens_per_forward / (whole_ms / 1000)
     covered_ms = sum(sample["gpu_time_ns"] for sample in rows) / forwards / 1e6
-    print(f"\n[{label}] complete command-buffer GPU time={whole_ms:.3f} ms/forward")
-    print("kernel                                      launches/forward  ms/forward  % of forward")
+    print(f"\n[{label}] complete command-buffer GPU time={whole_ms:.3f} ms/forward, GPU throughput={baseline_tps:.2f} tok/s")
+    print("kernel                                      launches/forward  ms/forward  % of forward   +tok/s @1.2x   +tok/s @1.5x     +tok/s @2x     +tok/s @4x")
     for sample in rows:
         milliseconds = sample["gpu_time_ns"] / forwards / 1e6
-        share = milliseconds / whole_ms * 100 if whole_ms else 0
-        print(f"{sample['name']:<44} {sample['launches'] / forwards:>16.2f} {milliseconds:>11.3f} {share:>12.2f}%")
+        fraction = milliseconds / whole_ms if whole_ms else 0
+        gains = [baseline_tps * (1 / (1 - fraction + fraction / speedup) - 1) for speedup in (1.2, 1.5, 2, 4)]
+        print(f"{sample['name']:<44} {sample['launches'] / forwards:>16.2f} {milliseconds:>11.3f} "
+              f"{fraction * 100:>12.2f}% {gains[0]:>14.2f} {gains[1]:>14.2f} {gains[2]:>14.2f} {gains[3]:>14.2f}")
     if covered_ms < whole_ms:
+        fraction = (whole_ms - covered_ms) / whole_ms
+        gains = [baseline_tps * (1 / (1 - fraction + fraction / speedup) - 1) for speedup in (1.2, 1.5, 2, 4)]
         print(f"{'unattributed gaps/barriers':<44} {'':>16} {whole_ms - covered_ms:>11.3f} "
-              f"{(whole_ms - covered_ms) / whole_ms * 100:>12.2f}%")
+              f"{fraction * 100:>12.2f}% {gains[0]:>14.2f} {gains[1]:>14.2f} {gains[2]:>14.2f} {gains[3]:>14.2f}")
 
 
 def main():
@@ -75,8 +80,8 @@ def main():
         after = snapshot(model); decode_delta = delta(middle, after); session.close()
         merge(prefill, prefill_delta["kernels"]); merge(decode, decode_delta["kernels"])
         prefill_gpu += prefill_delta["gpu_time_ns"]; decode_gpu += decode_delta["gpu_time_ns"]
-    report("prefill", prefill, prefill_gpu, args.iters)
-    report("decode", decode, decode_gpu, args.iters * args.decode)
+    report("prefill", prefill, prefill_gpu, args.iters, args.prefill)
+    report("decode", decode, decode_gpu, args.iters * args.decode, 1)
     model.close()
 
 
