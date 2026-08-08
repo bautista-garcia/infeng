@@ -25,17 +25,17 @@ template<uint K>
 static inline __attribute__((always_inline)) void dequant_tile(q4k_tag, threadgroup half* b_tile,
                                                                device const uchar* w, long n0, long kb,
                                                                uint simd_lane, uint simd_group) {
-    for (uint p = 0; p < 4; ++p) {
-        uint n = simd_group * 4 + p;
+    for (uint p = 0; p < 2; ++p) {
+        uint n = simd_group * 2 + p;
         long o = long(n0 + n) * (K / 256) * 144 + kb * 144;
         float d = float(h16(w + o)), dm = float(h16(w + o + 2));
         for (uint t = 0; t < 4; ++t) {
             uchar sc, mn, q = w[o + 16 + t * 32 + simd_lane];
             uint r = t * 64 + simd_lane, j = t * 2;
             scale_min_k4(j, w + o + 4, sc, mn);
-            b_tile[r * 16 + n] = half(d * float(sc) * float(q & 15) - dm * float(mn));
+            b_tile[r * 33 + n] = half(d * float(sc) * float(q & 15) - dm * float(mn));
             scale_min_k4(j + 1, w + o + 4, sc, mn);
-            b_tile[(r + 32) * 16 + n] = half(d * float(sc) * float(q >> 4) - dm * float(mn));
+            b_tile[(r + 32) * 33 + n] = half(d * float(sc) * float(q >> 4) - dm * float(mn));
         }
     }
 }
@@ -44,8 +44,8 @@ template<uint K>
 static inline __attribute__((always_inline)) void dequant_tile(q5k_tag, threadgroup half* b_tile,
                                                                device const uchar* w, long n0, long kb,
                                                                uint simd_lane, uint simd_group) {
-    for (uint p = 0; p < 4; ++p) {
-        uint n = simd_group * 4 + p;
+    for (uint p = 0; p < 2; ++p) {
+        uint n = simd_group * 2 + p;
         long o = long(n0 + n) * (K / 256) * 176 + kb * 176;
         float d = float(h16(w + o)), dm = float(h16(w + o + 2));
         uchar hm = w[o + 16 + simd_lane];
@@ -53,9 +53,9 @@ static inline __attribute__((always_inline)) void dequant_tile(q5k_tag, threadgr
             uchar sc, mn, q = w[o + 48 + t * 32 + simd_lane];
             uint r = t * 64 + simd_lane, j = t * 2;
             scale_min_k4(j, w + o + 4, sc, mn);
-            b_tile[r * 16 + n] = half(d * float(sc) * float((q & 15) + ((hm & (1 << j)) ? 16 : 0)) - dm * float(mn));
+            b_tile[r * 33 + n] = half(d * float(sc) * float((q & 15) + ((hm & (1 << j)) ? 16 : 0)) - dm * float(mn));
             scale_min_k4(j + 1, w + o + 4, sc, mn);
-            b_tile[(r + 32) * 16 + n] = half(d * float(sc) * float((q >> 4) + ((hm & (1 << (j + 1))) ? 16 : 0)) - dm * float(mn));
+            b_tile[(r + 32) * 33 + n] = half(d * float(sc) * float((q >> 4) + ((hm & (1 << (j + 1))) ? 16 : 0)) - dm * float(mn));
         }
     }
 }
@@ -64,8 +64,8 @@ template<uint K>
 static inline __attribute__((always_inline)) void dequant_tile(q6k_tag, threadgroup half* b_tile,
                                                                device const uchar* w, long n0, long kb,
                                                                uint simd_lane, uint simd_group) {
-    for (uint p = 0; p < 4; ++p) {
-        uint n = simd_group * 4 + p, l = simd_lane;
+    for (uint p = 0; p < 2; ++p) {
+        uint n = simd_group * 2 + p, l = simd_lane;
         long o = long(n0 + n) * (K / 256) * 210 + kb * 210;
         float d = float(h16(w + o + 208));
         for (uint h = 0; h < 2; ++h) for (uint s = 0; s < 4; ++s) {
@@ -73,7 +73,7 @@ static inline __attribute__((always_inline)) void dequant_tile(q6k_tag, threadgr
             uchar q = w[o + qlo], lo = (rr & 64) ? (q >> 4) : (q & 15);
             uchar hi = (w[o + 128 + h * 32 + l] >> (2 * s)) & 3;
             char sc = char(w[o + 192 + h * 8 + (rr >> 4)]);
-            b_tile[r * 16 + n] = half(d * float(sc) * (float((hi << 4) | lo) - 32.0f));
+            b_tile[r * 33 + n] = half(d * float(sc) * (float((hi << 4) | lo) - 32.0f));
         }
     }
 }
@@ -82,12 +82,12 @@ template<uint K>
 static inline __attribute__((always_inline)) void dequant_tile(q8_0_tag, threadgroup half* b_tile,
                                                                device const uchar* w, long n0, long kb,
                                                                uint simd_lane, uint simd_group) {
-    for (uint p = 0; p < 4; ++p) {
-        uint n = simd_group * 4 + p;
+    for (uint p = 0; p < 2; ++p) {
+        uint n = simd_group * 2 + p;
         long base = long(n0 + n) * (K / 32) * 34 + kb * 8 * 34;
         for (uint t = 0; t < 8; ++t) {
             long o = base + t * 34;
-            b_tile[(t * 32 + simd_lane) * 16 + n] = half(float(h16(w + o)) * float(char(w[o + 2 + simd_lane])));
+            b_tile[(t * 32 + simd_lane) * 33 + n] = half(float(h16(w + o)) * float(char(w[o + 2 + simd_lane])));
         }
     }
 }
@@ -96,8 +96,8 @@ template<uint K>
 static inline __attribute__((always_inline)) void dequant_tile(iq4xs_tag, threadgroup half* b_tile,
                                                                device const uchar* w, long n0, long kb,
                                                                uint simd_lane, uint simd_group) {
-    for (uint p = 0; p < 4; ++p) {
-        uint n = simd_group * 4 + p;
+    for (uint p = 0; p < 2; ++p) {
+        uint n = simd_group * 2 + p;
         long o = long(n0 + n) * (K / 256) * 136 + kb * 136;
         float d = float(h16(w + o));
         ushort sh = ushort(w[o + 2]) | (ushort(w[o + 3]) << 8);
@@ -105,44 +105,56 @@ static inline __attribute__((always_inline)) void dequant_tile(iq4xs_tag, thread
             uint r = j * 32 + simd_lane, qj = j * 16 + (simd_lane & 15);
             int ls = int((w[o + 4 + (j >> 1)] >> (4 * (j & 1))) & 15) | int(((sh >> (2 * j)) & 3) << 4);
             uchar q = w[o + 8 + qj], v = (simd_lane & 16) ? (q >> 4) : (q & 15);
-            b_tile[r * 16 + n] = half(d * float(ls - 32) * iq4nl[v]);
+            b_tile[r * 33 + n] = half(d * float(ls - 32) * iq4nl[v]);
         }
     }
 }
 
 template<typename Q, uint K, uint N>
-[[max_total_threads_per_threadgroup(128)]]
+[[max_total_threads_per_threadgroup(512)]]
 kernel void prefill_qk(device half* y [[buffer(0)]], device const half* x [[buffer(1)]],
                        device const uchar* w [[buffer(2)]], constant long& M [[buffer(3)]],
                        uint3 lane3 [[thread_position_in_threadgroup]],
                        uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]],
                        uint3 group [[threadgroup_position_in_grid]]) {
     uint lane = lane3.x, rb = simd_group * 8;
-    long n0 = long(group.x) * 16, m0 = long(group.y) * 32;
-    threadgroup half b_tile[256 * 16];
-    threadgroup float scratch[4 * 2 * 64];
+    long n0 = long(group.x) * 32, m0 = long(group.y) * 128;
+    bool active = m0 + rb < M;
+    threadgroup half b_tile[256 * 33];
     simdgroup_matrix<float, 8, 8> c0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     simdgroup_matrix<float, 8, 8> c1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> c2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> c3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     for (long k0 = 0, kb = 0; k0 < K; k0 += 256, ++kb) {
         device const half* x_ptr = x + m0 * K + k0;
         dequant_tile<K>(Q(), b_tile, w, n0, kb, simd_lane, simd_group);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_matrix<half, 8, 8> a, b;
-        for (uint ko = 0; ko < 256; ko += 8) {
-            simdgroup_load(a, x_ptr, K, ulong2(ko, rb));
-            simdgroup_load(b, b_tile, 16, ulong2(0, ko)); simdgroup_multiply_accumulate(c0, a, b, c0);
-            simdgroup_load(b, b_tile, 16, ulong2(8, ko)); simdgroup_multiply_accumulate(c1, a, b, c1);
+        if (active) {
+            simdgroup_matrix<half, 8, 8> a, b;
+            for (uint ko = 0; ko < 256; ko += 8) {
+                simdgroup_load(a, x_ptr, K, ulong2(ko, rb));
+                simdgroup_load(b, b_tile, 33, ulong2(0, ko)); simdgroup_multiply_accumulate(c0, a, b, c0);
+                simdgroup_load(b, b_tile, 33, ulong2(8, ko)); simdgroup_multiply_accumulate(c1, a, b, c1);
+                simdgroup_load(b, b_tile, 33, ulong2(16, ko)); simdgroup_multiply_accumulate(c2, a, b, c2);
+                simdgroup_load(b, b_tile, 33, ulong2(24, ko)); simdgroup_multiply_accumulate(c3, a, b, c3);
+            }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_none);
     }
-    simdgroup_store(c0, scratch + simd_group * 128, 16);
-    simdgroup_store(c1, scratch + simd_group * 128 + 8, 16);
+    threadgroup float* scratch = reinterpret_cast<threadgroup float*>(b_tile);
+    if (active) {
+        simdgroup_store(c0, scratch + simd_group * 256, 32);
+        simdgroup_store(c1, scratch + simd_group * 256 + 8, 32);
+        simdgroup_store(c2, scratch + simd_group * 256 + 16, 32);
+        simdgroup_store(c3, scratch + simd_group * 256 + 24, 32);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device half2* y2 = reinterpret_cast<device half2*>(y);
-    for (uint idx = lane; idx < 32 * 8; idx += 128) {
-        uint r = idx >> 3, cp = idx & 7, e = ((r & 7) << 4) + (cp << 1);
-        y2[((m0 + r) * N + n0 + (cp << 1)) >> 1] = half2(half(scratch[(r >> 3) * 128 + e]),
-                                                          half(scratch[(r >> 3) * 128 + e + 1]));
+    uint rows = uint(min(128l, M - m0));
+    for (uint idx = lane; idx < rows * 16; idx += 512) {
+        uint r = idx >> 4, cp = idx & 15, e = (r & 7) * 32 + (cp << 1);
+        y2[((m0 + r) * N + n0 + (cp << 1)) >> 1] = half2(half(scratch[(r >> 3) * 256 + e]),
+                                                          half(scratch[(r >> 3) * 256 + e + 1]));
     }
 }
 
@@ -488,11 +500,12 @@ kernel void q4_k_embed(device half* y [[buffer(0)]], device const int* ids [[buf
     y[t * K + col] = half(float(h16(w + o)) * float(sc) * float(v) - float(h16(w + o + 2)) * float(mn));
 }
 
-template [[host_name("q4_k_k4096_n1024_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 1024>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q4_k_k4096_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q4_k_k12288_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 12288, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q4_k_k4096_n8192_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 8192>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q4_k_k4096_n12288_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 12288>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
+#define PREFILL_ARGS device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3
+template [[host_name("q4_k_k4096_n1024_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("q4_k_k4096_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 4096>(PREFILL_ARGS);
+template [[host_name("q4_k_k12288_n4096_prefill")]] kernel void prefill_qk<q4k_tag, 12288, 4096>(PREFILL_ARGS);
+template [[host_name("q4_k_k4096_n8192_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 8192>(PREFILL_ARGS);
+template [[host_name("q4_k_k4096_n12288_prefill")]] kernel void prefill_qk<q4k_tag, 4096, 12288>(PREFILL_ARGS);
 #define DECODE_ARGS device half*, device const half*, device const uchar*, device const half*, \
                     constant uint&, constant uint&, constant uint&, ushort, ushort, uint3
 
@@ -502,26 +515,26 @@ template [[host_name("q4_k_k12288_n4096_decode")]] kernel void decode_q4k<12288,
 template [[host_name("q4_k_k4096_n8192_decode")]] kernel void decode_q4k<4096, 8192>(DECODE_ARGS);
 template [[host_name("q4_k_k4096_n12288_decode")]] kernel void decode_q4k<4096, 12288>(DECODE_ARGS);
 
-template [[host_name("q5_k_k4096_n1024_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 1024>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q5_k_k4096_n4096_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q5_k_k12288_n4096_prefill")]] kernel void prefill_qk<q5k_tag, 12288, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q5_k_k4096_n8192_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 8192>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q5_k_k4096_n12288_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 12288>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
+template [[host_name("q5_k_k4096_n1024_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("q5_k_k4096_n4096_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 4096>(PREFILL_ARGS);
+template [[host_name("q5_k_k12288_n4096_prefill")]] kernel void prefill_qk<q5k_tag, 12288, 4096>(PREFILL_ARGS);
+template [[host_name("q5_k_k4096_n8192_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 8192>(PREFILL_ARGS);
+template [[host_name("q5_k_k4096_n12288_prefill")]] kernel void prefill_qk<q5k_tag, 4096, 12288>(PREFILL_ARGS);
 template [[host_name("q5_k_k4096_n1024_decode")]] kernel void decode_q5k<4096, 1024>(DECODE_ARGS);
 template [[host_name("q5_k_k4096_n4096_decode")]] kernel void decode_q5k<4096, 4096>(DECODE_ARGS);
 template [[host_name("q5_k_k12288_n4096_decode")]] kernel void decode_q5k<12288, 4096>(DECODE_ARGS);
 template [[host_name("q5_k_k4096_n8192_decode")]] kernel void decode_q5k<4096, 8192>(DECODE_ARGS);
 template [[host_name("q5_k_k4096_n12288_decode")]] kernel void decode_q5k<4096, 12288>(DECODE_ARGS);
 
-template [[host_name("q6_k_k4096_n1024_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 1024>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q6_k_k12288_n4096_prefill")]] kernel void prefill_qk<q6k_tag, 12288, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
-template [[host_name("q6_k_k4096_n248320_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 248320>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
+template [[host_name("q6_k_k4096_n1024_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 1024>(PREFILL_ARGS);
+template [[host_name("q6_k_k12288_n4096_prefill")]] kernel void prefill_qk<q6k_tag, 12288, 4096>(PREFILL_ARGS);
+template [[host_name("q6_k_k4096_n248320_prefill")]] kernel void prefill_qk<q6k_tag, 4096, 248320>(PREFILL_ARGS);
 template [[host_name("q6_k_k4096_n1024_decode")]] kernel void decode_q6k<4096, 1024>(DECODE_ARGS);
 template [[host_name("q6_k_k12288_n4096_decode")]] kernel void decode_q6k<12288, 4096>(DECODE_ARGS);
 template [[host_name("q6_k_k4096_n248320_decode")]] kernel void decode_q6k<4096, 248320>(DECODE_ARGS);
 
-template [[host_name("q8_0_k4096_n4096_prefill")]] kernel void prefill_qk<q8_0_tag, 4096, 4096>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
+template [[host_name("q8_0_k4096_n4096_prefill")]] kernel void prefill_qk<q8_0_tag, 4096, 4096>(PREFILL_ARGS);
 template [[host_name("q8_0_k4096_n4096_decode")]] kernel void decode_q8_0<4096, 4096>(DECODE_ARGS);
 
-template [[host_name("iq4_xs_k4096_n12288_prefill")]] kernel void prefill_qk<iq4xs_tag, 4096, 12288>(device half*, device const half*, device const uchar*, constant long&, uint3, uint, uint, uint3);
+template [[host_name("iq4_xs_k4096_n12288_prefill")]] kernel void prefill_qk<iq4xs_tag, 4096, 12288>(PREFILL_ARGS);
 template [[host_name("iq4_xs_k4096_n12288_decode")]] kernel void decode_iq4xs<4096, 12288>(DECODE_ARGS);
