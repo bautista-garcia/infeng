@@ -52,6 +52,9 @@ class CommandBuffer {
     uint64_t constantOffset = 0;
     uint32_t tableIndex = 0, counterIndex = 0, counterLimit = 0;
     template <class T> void scalar(MTL4::ArgumentTable* table, uint32_t index, const T& value);
+    template <bool Synchronize, class... Scalars>
+    void encodeDispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group,
+                        std::initializer_list<Tensor> tensors, const Scalars&... scalars);
     MTL4::ArgumentTable* table(uint32_t index);
     void copy(MTL::Buffer* source, uint64_t sourceOffset, MTL::Buffer* destination, uint64_t destinationOffset,
               uint64_t bytes);
@@ -64,6 +67,9 @@ public:
     template <class... Scalars>
     void dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group, std::initializer_list<Tensor> tensors,
                   const Scalars&... scalars);
+    template <class... Scalars>
+    void dispatchConcurrent(Pipeline* pipeline, MTL::Size threads, MTL::Size group,
+                            std::initializer_list<Tensor> tensors, const Scalars&... scalars);
     void commit();
 };
 class Device {
@@ -128,23 +134,34 @@ template <class T> void CommandBuffer::scalar(MTL4::ArgumentTable* table, uint32
     std::memcpy(static_cast<uint8_t*>(constants.buffer->metalBuffer->contents()) + constantOffset, &value, sizeof(T));
     table->setAddress(constants.address() + constantOffset, index); constantOffset += sizeof(T);
 }
-template <class... Scalars>
-void CommandBuffer::dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group,
-                             std::initializer_list<Tensor> tensors, const Scalars&... scalars) {
+template <bool Synchronize, class... Scalars>
+void CommandBuffer::encodeDispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group,
+                                   std::initializer_list<Tensor> tensors, const Scalars&... scalars) {
     uint32_t start = 0, end = 0;
     if (counterHeap) {
-        if (counterIndex + 2 > counterLimit) throw std::runtime_error("command buffer counter storage exceeded");
+        if (counterIndex + 2 > counterLimit)
+            throw std::runtime_error("command buffer counter storage exceeded");
         start = counterIndex++; encoder->writeTimestamp(MTL4::TimestampGranularityPrecise, counterHeap, start);
     }
     auto* argumentTable = table(tableIndex++); uint32_t index = 0;
     for (const Tensor& tensor : tensors) argumentTable->setAddress(tensor.address(), index++);
     (scalar(argumentTable, index++, scalars), ...);
-    encoder->setComputePipelineState(pipeline); encoder->setArgumentTable(argumentTable);
-    encoder->dispatchThreads(threads, group);
-    encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
+    encoder->setComputePipelineState(pipeline); encoder->setArgumentTable(argumentTable); encoder->dispatchThreads(threads, group);
+    if (Synchronize || counterHeap)
+        encoder->barrierAfterEncoderStages(MTL::StageDispatch, MTL::StageDispatch, MTL4::VisibilityOptionDevice);
     if (counterHeap) {
         end = counterIndex++; encoder->writeTimestamp(MTL4::TimestampGranularityPrecise, counterHeap, end);
         profiles.push_back({device.pipelineName(pipeline), start, end});
     }
+}
+template <class... Scalars>
+void CommandBuffer::dispatch(Pipeline* pipeline, MTL::Size threads, MTL::Size group,
+                             std::initializer_list<Tensor> tensors, const Scalars&... scalars) {
+    encodeDispatch<true>(pipeline, threads, group, tensors, scalars...);
+}
+template <class... Scalars>
+void CommandBuffer::dispatchConcurrent(Pipeline* pipeline, MTL::Size threads, MTL::Size group,
+                                       std::initializer_list<Tensor> tensors, const Scalars&... scalars) {
+    encodeDispatch<false>(pipeline, threads, group, tensors, scalars...);
 }
 }  // namespace infeng::metal

@@ -8,26 +8,34 @@ constexpr uint64_t halfBytes = 2;
 MTL::Size size(uint64_t x, uint64_t y = 1, uint64_t z = 1) { return MTL::Size(x, y, z); }
 uint64_t roundUp(uint64_t value, uint64_t alignment) { return (value + alignment - 1) / alignment * alignment; }
 Tensor linear(CommandBuffer& commandBuffer, const Tensor& x, const Linear& weight, uint32_t rows, Tensor output, Scratch& scratch,
-              uint32_t mode = 0, const Tensor* aux = nullptr, uint32_t context = 0) {
+              uint32_t mode = 0, const Tensor* aux = nullptr, uint32_t context = 0, bool synchronize = true) {
     if (weight.type == QuantType::F16) {
-        commandBuffer.dispatch(weight.decode, size(1024, rows), size(32), {output, x, weight.weight}, rows); return output;
+        if (synchronize) commandBuffer.dispatch(weight.decode, size(1024, rows), size(32), {output, x, weight.weight}, rows);
+        else commandBuffer.dispatchConcurrent(weight.decode, size(1024, rows), size(32), {output, x, weight.weight}, rows);
+        return output;
     }
     if (rows == 1) {
         const Tensor& extra = aux ? *aux : output;
-        commandBuffer.dispatch(weight.decode, size(((weight.n + weight.outputsPerGroup - 1) / weight.outputsPerGroup) * weight.decodeThreads),
-                      size(weight.decodeThreads), {output, x, weight.weight, extra}, mode, context, uint32_t(0));
+        MTL::Size threads = size(((weight.n + weight.outputsPerGroup - 1) / weight.outputsPerGroup) * weight.decodeThreads);
+        if (synchronize) commandBuffer.dispatch(weight.decode, threads, size(weight.decodeThreads),
+                                                {output, x, weight.weight, extra}, mode, context, uint32_t(0));
+        else commandBuffer.dispatchConcurrent(weight.decode, threads, size(weight.decodeThreads),
+                                              {output, x, weight.weight, extra}, mode, context, uint32_t(0));
         return output;
     }
     if (mode) throw std::runtime_error("quant prefill has no fused store mode");
-    uint32_t padded = roundUp(rows, 32); Tensor source = x, target = output;
+    uint32_t padded = roundUp(rows, 8); Tensor source = x, target = output;
     if (padded != rows) {
         source = scratch.padInput.view(0, uint64_t(padded) * weight.k * halfBytes);
         uint64_t total = uint64_t(padded) * weight.k;
         commandBuffer.dispatch(scratch.padRows,
                       size(roundUp(total, 256)), size(256), {source, x}, rows, padded, weight.k);
     }
-    commandBuffer.dispatch(weight.prefill, size(128 * (weight.n / 16), padded / 32), size(128),
-                  {target, source, weight.weight}, int64_t(padded));
+    uint32_t rowGroups = (padded + 127) / 128;
+    if (synchronize) commandBuffer.dispatch(weight.prefill, size(512 * (weight.n / 32), rowGroups), size(512),
+                                            {target, source, weight.weight}, int64_t(padded));
+    else commandBuffer.dispatchConcurrent(weight.prefill, size(512 * (weight.n / 32), rowGroups), size(512),
+                                          {target, source, weight.weight}, int64_t(padded));
     return target.view(0, uint64_t(rows) * weight.n * halfBytes);
 }
 Tensor rms(CommandBuffer& commandBuffer, Model& model, const Tensor& x, const Tensor& weight, Tensor output, uint32_t rows, uint32_t dim) {
@@ -42,7 +50,7 @@ Tensor mlp(CommandBuffer& commandBuffer, Model& model, const Tensor& x, const Ml
         commandBuffer.dispatch(weights.fusedDecode, size(12288 / weights.outputsPerGroup * weights.decodeThreads),
                       size(weights.decodeThreads), {scratch.mlpMixed, x, weights.gate.weight, weights.up.weight}, int64_t(1));
     } else {
-        Tensor gate = linear(commandBuffer, x, weights.gate, seq, scratch.mlpGate, scratch);
+        Tensor gate = linear(commandBuffer, x, weights.gate, seq, scratch.mlpGate, scratch, 0, nullptr, 0, false);
         Tensor up = linear(commandBuffer, x, weights.up, seq, scratch.mlpUp, scratch); uint64_t elements = uint64_t(seq) * 12288;
         commandBuffer.dispatch(model.kernels.siluMul, size(roundUp(elements, 256)), size(256),
                       {scratch.mlpMixed, gate, up}, uint32_t(elements));
@@ -54,8 +62,8 @@ Tensor attention(CommandBuffer& commandBuffer, Model& model, const Layer& layer,
     const AttentionWeights& weights = layer.attention; uint32_t start = session.length;
     Tensor cacheK = session.kv.key(layer.kvIndex), cacheV = session.kv.value(layer.kvIndex);
     if (seq == 1) {
-        Tensor qg = linear(commandBuffer, x, weights.q, 1, scratch.attnQG, scratch);
-        Tensor rawK = linear(commandBuffer, x, weights.k, 1, scratch.attnK, scratch);
+        Tensor qg = linear(commandBuffer, x, weights.q, 1, scratch.attnQG, scratch, 0, nullptr, 0, false);
+        Tensor rawK = linear(commandBuffer, x, weights.k, 1, scratch.attnK, scratch, 0, nullptr, 0, false);
         linear(commandBuffer, x, weights.v, 1, cacheV, scratch, 1, nullptr, start);
         uint32_t splits = std::min(8u, start + 1);
         commandBuffer.dispatch(model.kernels.attentionDecodeScan, size(16 * splits * 128), size(128),
@@ -65,13 +73,14 @@ Tensor attention(CommandBuffer& commandBuffer, Model& model, const Layer& layer,
                       {scratch.attnOut, scratch.attnPartials, qg}, splits);
         return linear(commandBuffer, scratch.attnOut, weights.out, 1, destination, scratch, 2, &residual);
     }
-    Tensor qg = linear(commandBuffer, x, weights.q, seq, scratch.attnQG, scratch); uint64_t qElements = uint64_t(seq) * 4096;
-    commandBuffer.dispatch(model.kernels.unpackAttention, size(roundUp(qElements, 256)), size(256),
-                  {scratch.attnQ, scratch.attnGate, qg}, uint32_t(qElements));
-    Tensor q = rms(commandBuffer, model, scratch.attnQ, weights.qNorm, scratch.attnQNorm, seq * 16, 256);
-    Tensor k = linear(commandBuffer, x, weights.k, seq, scratch.attnK, scratch);
-    k = rms(commandBuffer, model, k, weights.kNorm, scratch.attnKNorm, seq * 4, 256);
+    Tensor qg = linear(commandBuffer, x, weights.q, seq, scratch.attnQG, scratch, 0, nullptr, 0, false);
+    Tensor k = linear(commandBuffer, x, weights.k, seq, scratch.attnK, scratch, 0, nullptr, 0, false);
     Tensor v = linear(commandBuffer, x, weights.v, seq, scratch.attnV, scratch);
+    uint64_t qElements = uint64_t(seq) * 4096;
+    commandBuffer.dispatchConcurrent(model.kernels.unpackAttention, size(roundUp(qElements, 256)), size(256),
+                                     {scratch.attnQ, scratch.attnGate, qg}, uint32_t(qElements));
+    k = rms(commandBuffer, model, k, weights.kNorm, scratch.attnKNorm, seq * 4, 256);
+    Tensor q = rms(commandBuffer, model, scratch.attnQ, weights.qNorm, scratch.attnQNorm, seq * 16, 256);
     commandBuffer.dispatch(model.kernels.ropeQk, size(roundUp(qElements, 256)), size(256),
                   {scratch.attnQRope, scratch.attnKRope, q, k, model.rope}, seq, start);
     commandBuffer.dispatch(model.kernels.attentionPrefill, size(uint64_t(seq) * 16 * 128), size(128),
@@ -85,12 +94,12 @@ Tensor attention(CommandBuffer& commandBuffer, Model& model, const Layer& layer,
 Tensor gdn(CommandBuffer& commandBuffer, Model& model, const Layer& layer, const Tensor& x, const Tensor& residual,
            Tensor destination, Scratch& scratch, LayerState& state, uint32_t seq) {
     const GdnWeights& weights = layer.gdn;
-    Tensor mixed = linear(commandBuffer, x, weights.qkv, seq, scratch.gdnMixed, scratch);
-    Tensor z = linear(commandBuffer, x, weights.z, seq, scratch.gdnZ, scratch);
-    Tensor b = linear(commandBuffer, x, weights.b, seq, scratch.gdnB, scratch);
+    Tensor mixed = linear(commandBuffer, x, weights.qkv, seq, scratch.gdnMixed, scratch, 0, nullptr, 0, false);
+    Tensor z = linear(commandBuffer, x, weights.z, seq, scratch.gdnZ, scratch, 0, nullptr, 0, false);
+    Tensor b = linear(commandBuffer, x, weights.b, seq, scratch.gdnB, scratch, 0, nullptr, 0, false);
     Tensor a = linear(commandBuffer, x, weights.a, seq, scratch.gdnA, scratch); uint64_t heads = uint64_t(seq) * 32;
-    commandBuffer.dispatch(model.kernels.gdnPrepare, size(roundUp(heads, 256)), size(256),
-                  {scratch.gdnBeta, scratch.gdnG, b, a, weights.A, weights.dt}, uint32_t(heads));
+    commandBuffer.dispatchConcurrent(model.kernels.gdnPrepare, size(roundUp(heads, 256)), size(256),
+                                     {scratch.gdnBeta, scratch.gdnG, b, a, weights.A, weights.dt}, uint32_t(heads));
     uint8_t slot = 1 - state.convSlot; const Tensor& previous = state.initialized ? state.conv[state.convSlot] : state.conv[slot];
     commandBuffer.dispatch(model.kernels.gdnConv, size(uint64_t(8192) * std::max(seq, 4u)), size(256),
                   {scratch.gdnConvolved, state.conv[slot], mixed, weights.conv, previous},
@@ -104,17 +113,12 @@ Tensor gdn(CommandBuffer& commandBuffer, Model& model, const Layer& layer, const
                        scratch.gdnG, scratch.gdnBeta},
                       int64_t(1), int64_t(1), int64_t(32), int64_t(4096), int64_t(4096), int64_t(128),
                       int64_t(1), state.initialized);
-    } else for (uint32_t start = 0; start < seq; start += 16) {
-        uint32_t count = std::min(16u, seq - start); uint64_t halfOffset = uint64_t(start) * 4096 * halfBytes;
+    } else {
         commandBuffer.dispatch(model.kernels.deltaPrefill, size(128, 32), size(128),
-                      {scratch.gdnDelta.view(halfOffset, uint64_t(count) * 4096 * halfBytes), state.recurrent,
-                       scratch.gdnQ.view(halfOffset, uint64_t(count) * 4096 * halfBytes),
-                       scratch.gdnK.view(halfOffset, uint64_t(count) * 4096 * halfBytes),
-                       scratch.gdnV.view(halfOffset, uint64_t(count) * 4096 * halfBytes),
-                       scratch.gdnG.view(uint64_t(start) * 32 * 4, uint64_t(count) * 32 * 4),
-                       scratch.gdnBeta.view(uint64_t(start) * 32 * 2, uint64_t(count) * 32 * 2)},
-                      int64_t(1), int64_t(count), int64_t(32), int64_t(count) * 4096, int64_t(4096),
-                      int64_t(128), int64_t(1), state.initialized || start > 0);
+                      {scratch.gdnDelta, state.recurrent, scratch.gdnQ, scratch.gdnK, scratch.gdnV,
+                       scratch.gdnG, scratch.gdnBeta},
+                      int64_t(1), int64_t(seq), int64_t(32), int64_t(seq) * 4096, int64_t(4096),
+                      int64_t(128), int64_t(1), state.initialized);
     }
     state.initialized = true;
     commandBuffer.dispatch(model.kernels.gdnNorm, size(128, uint64_t(seq) * 32), size(128),
@@ -143,7 +147,7 @@ void sample(CommandBuffer& commandBuffer, Model& model, Session& session, const 
 }
 }  // namespace
 void Scratch::ensure(Device& device, uint32_t seq) {
-    uint32_t target = roundUp(seq, 32); if (target <= capacity) return; capacity = target;
+    uint32_t target = seq == 1 ? 32 : roundUp(seq, 128); if (target <= capacity) return; capacity = target;
     uint64_t rows = target, hiddenBytes = rows * 4096 * 2, mlpBytes = rows * 12288 * 2;
     std::vector<std::pair<Tensor*, uint64_t>> slots = {
         {&hidden[0], hiddenBytes}, {&hidden[1], hiddenBytes}, {&inputNorm, hiddenBytes}, {&postNorm, hiddenBytes},
@@ -179,7 +183,7 @@ int32_t forward(Model& model, Session& session, const int32_t* ids, uint32_t seq
     if (!seq || session.length + seq > model.maxContext) throw std::runtime_error("forward exceeds maximum context");
     // ensure acts like a page fault if there isn't enough kv allocated
     model.device.write(session.inputIds, ids, uint64_t(seq) * sizeof(int32_t)); session.kv.ensure(session.length + seq);
-    Scratch& scratch = model.scratch(seq); scratch.padRows = model.kernels.padRows; uint32_t chunks = (seq + 15) / 16;
+    Scratch& scratch = model.scratch(seq); scratch.padRows = model.kernels.padRows; uint32_t chunks = (seq + 31) / 32;
     CommandBuffer commands(model.device, uint64_t(512 + 24 * chunks) * 128, true, 1024 + 24 * chunks,
                            seq == 1 ? "decode" : "prefill");
     commands.dispatch(model.kernels.embed, size(4096, seq), size(256),
