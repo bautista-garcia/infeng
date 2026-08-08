@@ -4,16 +4,22 @@ using namespace metal;
 kernel void rmsnorm(device half* y [[buffer(0)]], device const half* x [[buffer(1)]],
                     device const float* w [[buffer(2)]], constant uint& rows [[buffer(3)]],
                     constant uint& dim [[buffer(4)]], constant float& eps [[buffer(5)]],
-                    uint lane [[thread_index_in_threadgroup]], uint2 pos [[threadgroup_position_in_grid]]) {
+                    uint lane [[thread_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
+                    uint simd_group [[simdgroup_index_in_threadgroup]], uint2 pos [[threadgroup_position_in_grid]]) {
     uint row = pos.y;
     if (row >= rows) return;
-    threadgroup float sums[256];
+    threadgroup float sums[9];
     float sum = 0.0f;
     for (uint d = lane; d < dim; d += 256) { float v = float(x[row * dim + d]); sum += v * v; }
-    sums[lane] = sum; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = 128; s; s >>= 1) { if (lane < s) sums[lane] += sums[lane + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
-    float scale = rsqrt(sums[0] / float(dim) + eps);
-    for (uint d = lane; d < dim; d += 256) y[row * dim + d] = half(float(x[row * dim + d]) * scale * w[d]);
+    sum = simd_sum(sum);
+    if (simd_lane == 0) sums[simd_group] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        sum = simd_lane < 8 ? sums[simd_lane] : 0.0f; sum = simd_sum(sum);
+        if (simd_lane == 0) sums[8] = rsqrt(sum / float(dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d = lane; d < dim; d += 256) y[row * dim + d] = half(float(x[row * dim + d]) * sums[8] * w[d]);
 }
 
 kernel void add_half(device half* y [[buffer(0)]], device const half* a [[buffer(1)]],
